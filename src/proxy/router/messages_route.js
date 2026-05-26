@@ -19,11 +19,52 @@ const { pickForTurn } = require('./model_router');
 const { rewriteModel } = require('./cache_passthrough');
 const { extractFeatures } = require('./features');
 
+// Bedrock-resolvable global.* aliases as of 2026-05-25:
+//   - opus-4-7    : bare alias OK
+//   - haiku-4-5   : ONLY the dated form resolves; bare alias 400s
+//                   ("ValidationException: invalid model identifier")
+//   - sonnet-4-7  : not yet on Bedrock — sonnet-4-6 is the current global.*
+//                   sonnet alias. The no-downgrade guard still blocks an
+//                   inbound sonnet-4-7 → sonnet-4-6 rewrite, so callers
+//                   pinned to 4-7 stay on 4-7.
 const DEFAULT_TIER_MODELS = Object.freeze({
-  cheap: 'claude-haiku-4-5',
-  mid: 'claude-sonnet-4-6',
-  expensive: 'claude-opus-4-7',
+  cheap: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+  mid: 'global.anthropic.claude-sonnet-4-6',
+  expensive: 'global.anthropic.claude-opus-4-7',
 });
+
+// No-downgrade guard: when the router rewrites a request to a different model
+// inside the same Claude family (opus / sonnet / haiku), the chosen generation
+// must be >= the original. This catches the 2026-05-25 /compact incident where
+// EVOMAP_MODEL_EXPENSIVE was misconfigured to opus-4-1 while users sent
+// opus-4-7 — every planning turn silently rewrote 4-7 → 4-1, hit Bedrock 5xx
+// on the older endpoint, and stalled the user behind retries. Cross-family
+// rewrites (opus → haiku for cheap tier) are the router's core function and
+// stay allowed; this guard only blocks intra-family generational downgrades.
+//
+// Parsers below handle two ID shapes the proxy actually sees:
+//   - global.anthropic.claude-{family}-{major}-{minor}
+//   - us.anthropic.claude-{family}-{major}-{minor}-YYYYMMDD-v1:0  (Bedrock dated)
+// Anything else (third-party, opaque alias) → null on both fields → guard
+// returns false (allow). We only block when we can prove the comparison.
+function parseClaudeId(modelId) {
+  if (typeof modelId !== 'string') return null;
+  const m = modelId.match(/claude-(opus|sonnet|haiku)-(\d+)-(\d+)/i);
+  if (!m) return null;
+  const major = Number(m[2]);
+  const minor = Number(m[3]);
+  if (!Number.isFinite(major) || !Number.isFinite(minor)) return null;
+  return { family: m[1].toLowerCase(), major, minor };
+}
+
+function isIntraFamilyDowngrade(chosen, original) {
+  const c = parseClaudeId(chosen);
+  const o = parseClaudeId(original);
+  if (!c || !o) return false;
+  if (c.family !== o.family) return false;
+  if (c.major !== o.major) return c.major < o.major;
+  return c.minor < o.minor;
+}
 
 function resolveTierModels() {
   return {
@@ -51,10 +92,23 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
     // ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN env (token mediation, see
     // _proxyAnthropic). The proxy server itself has already auth-checked
     // `Authorization: Bearer <proxy_token>` before reaching this handler.
-    const hasInboundKey = !!inboundHeaders['x-api-key'];
-    const hasProxyEnvCreds = !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
-    if (!hasInboundKey && !hasProxyEnvCreds) {
-      throw Object.assign(new Error('x-api-key required'), { statusCode: 401 });
+    //
+    // Bedrock upstream uses SigV4 with AWS_* env, so neither inbound
+    // x-api-key nor ANTHROPIC_* env are meaningful. Skip the check —
+    // the real proxy gate is still the Bearer proxy_token enforced
+    // upstream of this handler in ProxyHttpServer.
+    // Read EVOMAP_UPSTREAM exactly once per request and thread it through to
+    // the proxy callable via opts.upstreamMode. Reading it here AND in the
+    // dispatch closure would let a mid-request env hot-swap make the two
+    // decisions disagree (e.g. gate skipped on the assumption of bedrock,
+    // but the request still hits _proxyAnthropic with no credentials).
+    const upstreamMode = (process.env.EVOMAP_UPSTREAM || 'anthropic').toLowerCase();
+    if (upstreamMode !== 'bedrock') {
+      const hasInboundKey = !!inboundHeaders['x-api-key'];
+      const hasProxyEnvCreds = !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
+      if (!hasInboundKey && !hasProxyEnvCreds) {
+        throw Object.assign(new Error('x-api-key required'), { statusCode: 401 });
+      }
     }
 
     const originalModel = body && typeof body.model === 'string' ? body.model : null;
@@ -74,7 +128,23 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
         decisionTier = decision.tier;
         decisionReason = decision.reason;
         const tierModel = resolveTierModels()[decision.tier];
-        if (tierModel) chosenModel = tierModel;
+        if (tierModel) {
+          if (isIntraFamilyDowngrade(tierModel, originalModel)) {
+            // Intra-family downgrade detected (e.g. opus-4-7 -> opus-4-1).
+            // Refuse the rewrite, keep the user's original model, and log a
+            // structured fallback so misconfigured tier env vars are visible
+            // in telemetry instead of manifesting as latency / 5xx stalls.
+            fallback = 'downgrade_blocked';
+            log.warn?.(JSON.stringify({
+              event: 'router_fallback',
+              reason: 'downgrade_blocked',
+              original_model: originalModel,
+              would_have_been: tierModel,
+            }));
+          } else {
+            chosenModel = tierModel;
+          }
+        }
       } catch (err) {
         fallback = 'classifier_error';
         log.warn?.(JSON.stringify({
@@ -120,6 +190,7 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
 
     const upstream = await anthropicProxy('/v1/messages', outboundBody, {
       inboundHeaders,
+      upstreamMode,
     });
 
     if (upstream.stream) {
@@ -177,6 +248,7 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
         const retryBody = rewriteModel(body, originalModel);
         finalUpstream = await anthropicProxy('/v1/messages', retryBody, {
           inboundHeaders,
+          upstreamMode,
         });
       } catch (err) {
         // Replay the drained first response so the caller still sees the
@@ -239,4 +311,10 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled } = {}) {
   };
 }
 
-module.exports = { buildMessagesHandler, DEFAULT_TIER_MODELS, resolveTierModels };
+module.exports = {
+  buildMessagesHandler,
+  DEFAULT_TIER_MODELS,
+  resolveTierModels,
+  parseClaudeId,
+  isIntraFamilyDowngrade,
+};

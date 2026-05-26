@@ -94,8 +94,23 @@ class ProxyHttpServer {
   }
 
   async start() {
+    // Capture the prior token before clearIfStale wipes it. Daemon restarts
+    // routinely fall into the stale branch (the previous PID is gone), and
+    // rotating `proxy.token` on every restart invalidates ANTHROPIC_AUTH_TOKEN
+    // already exported into long-lived shells (the .bashrc auto-source only
+    // runs once per terminal).
+    const priorProxy = readSettings().proxy || {};
+    const previous = typeof priorProxy.token === 'string' ? priorProxy.token : null;
+    // settings.json is operator-edited; previous_tokens may contain non-strings
+    // (numbers, booleans, objects) that would later crash Buffer.from(cand, 'utf8')
+    // in _handleRequest as ERR_INVALID_ARG_TYPE — an unhandled rejection that
+    // takes the daemon down under default --unhandled-rejections=throw.
+    const priorPreviousTokens = Array.isArray(priorProxy.previous_tokens)
+      ? priorProxy.previous_tokens.filter((t) => typeof t === 'string' && t.length > 0)
+      : [];
     clearIfStale();
-    this.token = crypto.randomBytes(32).toString('hex');
+    this.token = previous || crypto.randomBytes(32).toString('hex');
+    this._priorPreviousTokens = priorPreviousTokens;
     this.server = http.createServer((req, res) => this._handleRequest(req, res));
 
     let port = this.basePort;
@@ -104,14 +119,16 @@ class ProxyHttpServer {
       if (ok) {
         this.actualPort = port;
         const url = `http://127.0.0.1:${port}`;
-        writeSettings({
-          proxy: {
-            url,
-            pid: process.pid,
-            started_at: new Date().toISOString(),
-            token: this.token,
-          },
-        });
+        const proxyBlock = {
+          url,
+          pid: process.pid,
+          started_at: new Date().toISOString(),
+          token: this.token,
+        };
+        if (this._priorPreviousTokens && this._priorPreviousTokens.length) {
+          proxyBlock.previous_tokens = this._priorPreviousTokens;
+        }
+        writeSettings({ proxy: proxyBlock });
         this.logger.log(`[proxy] HTTP server listening on ${url}`);
         return { port, url, token: this.token };
       }
@@ -131,11 +148,31 @@ class ProxyHttpServer {
   async _handleRequest(req, res) {
     const authHeader = req.headers['authorization'] || '';
     const provided = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    const expBuf = Buffer.from(this.token || '', 'utf8');
     const provBuf = Buffer.from(provided, 'utf8');
-    const valid = this.token &&
-      provBuf.length === expBuf.length &&
-      crypto.timingSafeEqual(provBuf, expBuf);
+    // Primary token plus any grace tokens from settings.json::proxy.previous_tokens.
+    // The grace list is the recovery path for the rare case where settings.json was
+    // wiped externally (logout, manual rm) while long-lived CC sessions still hold
+    // the pre-wipe token in their fork-time env. Operator writes the lost token into
+    // previous_tokens; once those sessions close, the operator can clear the array.
+    // Reading directly from settings.json (instead of an env shim) keeps the
+    // single source of truth on disk — no python bridge in the daemon hook.
+    // Defense in depth: even though start() filters non-strings before persisting,
+    // settings.json can be hand-edited between requests, so re-validate every read.
+    // A non-string slipping into Buffer.from below would throw ERR_INVALID_ARG_TYPE
+    // and unhandled-reject through the auth path.
+    const previous = readSettings().proxy?.previous_tokens;
+    const extras = Array.isArray(previous)
+      ? previous.filter((t) => typeof t === 'string' && t.length > 0)
+      : [];
+    const candidates = [this.token, ...extras].filter((t) => typeof t === 'string' && t.length > 0);
+    let valid = false;
+    for (const cand of candidates) {
+      const expBuf = Buffer.from(cand, 'utf8');
+      if (provBuf.length === expBuf.length && crypto.timingSafeEqual(provBuf, expBuf)) {
+        valid = true;
+        break;
+      }
+    }
     if (!valid) {
       return sendJson(res, 401, { error: 'Unauthorized' });
     }

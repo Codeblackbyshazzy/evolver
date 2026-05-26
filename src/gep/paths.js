@@ -77,7 +77,13 @@ function getRepoRoot() {
     while (dir !== path.dirname(dir)) {
       if (fs.existsSync(path.join(dir, '.git'))) {
         if (!process.env.EVOLVER_QUIET_PARENT_GIT) {
-          console.log('[evolver] Using host git repository at:', dir);
+          // Diagnostic, not data. Goes to stderr so it cannot poison
+          // a child process's stdout-as-JSON contract — the Stop hook
+          // emits JSON on stdout, and any caller invoking the hook via
+          // `execFileSync(...).stdout` + `JSON.parse(...)` would crash
+          // if this line landed there first. test/sessionEndHook.test.js
+          // was failing 5/5 locally for exactly this reason.
+          console.error('[evolver] Using host git repository at:', dir);
         }
         return dir;
       }

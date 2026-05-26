@@ -189,7 +189,7 @@ describe('POST /v1/messages — router rewrite + egress', () => {
 
   it('rewrites model to cheap on post-tool-result synthesis turns', async () => {
     const res = await rawPost(`${baseUrl}/v1/messages`, token, {
-      model: 'claude-opus-4-7',
+      model: 'global.anthropic.claude-opus-4-7',
       messages: [
         { role: 'user', content: 'do the thing' },
         {
@@ -204,27 +204,27 @@ describe('POST /v1/messages — router rewrite + egress', () => {
     });
     assert.equal(res.status, 200);
     const sentModel = captured[0]?.body?.model;
-    assert.equal(sentModel, 'claude-haiku-4-5', 'expected cheap tier model rewrite');
+    assert.equal(sentModel, 'global.anthropic.claude-haiku-4-5-20251001-v1:0', 'expected cheap tier model rewrite');
     const json = JSON.parse(res.body);
-    assert.equal(json.model, 'claude-haiku-4-5');
+    assert.equal(json.model, 'global.anthropic.claude-haiku-4-5-20251001-v1:0');
   });
 
   it('rewrites model to cheap on trivial lookups', async () => {
     const res = await rawPost(`${baseUrl}/v1/messages`, token, {
-      model: 'claude-opus-4-7',
+      model: 'global.anthropic.claude-opus-4-7',
       messages: [{ role: 'user', content: 'what is npm?' }],
     });
     assert.equal(res.status, 200);
-    assert.equal(captured[0]?.body?.model, 'claude-haiku-4-5');
+    assert.equal(captured[0]?.body?.model, 'global.anthropic.claude-haiku-4-5-20251001-v1:0');
   });
 
   it('rewrites model to expensive on planning keywords', async () => {
     const res = await rawPost(`${baseUrl}/v1/messages`, token, {
-      model: 'claude-sonnet-4-6',
+      model: 'global.anthropic.claude-sonnet-4-7',
       messages: [{ role: 'user', content: "Let's plan the migration in detail across the three services." }],
     });
     assert.equal(res.status, 200);
-    assert.equal(captured[0]?.body?.model, 'claude-opus-4-7');
+    assert.equal(captured[0]?.body?.model, 'global.anthropic.claude-opus-4-7');
   });
 
   it('accepts request without x-api-key when proxy has ANTHROPIC_API_KEY env (token mediation)', async () => {
@@ -234,7 +234,7 @@ describe('POST /v1/messages — router rewrite + egress', () => {
     delete process.env.ANTHROPIC_AUTH_TOKEN;
     try {
       const u = new URL(`${baseUrl}/v1/messages`);
-      const payload = JSON.stringify({ model: 'claude-opus-4-7', messages: [{ role: 'user', content: 'hi' }] });
+      const payload = JSON.stringify({ model: 'global.anthropic.claude-opus-4-7', messages: [{ role: 'user', content: 'hi' }] });
       const res = await new Promise((resolve, reject) => {
         const req = http.request({
           hostname: u.hostname,
@@ -302,7 +302,7 @@ describe('POST /v1/messages — router rewrite + egress', () => {
 
   it('passes through streaming responses with SSE bytes verbatim', async () => {
     const res = await rawPost(`${baseUrl}/v1/messages`, token, {
-      model: 'claude-opus-4-7',
+      model: 'global.anthropic.claude-opus-4-7',
       stream: true,
       messages: [{ role: 'user', content: 'hi' }],
     });
@@ -318,7 +318,7 @@ describe('POST /v1/messages — router rewrite + egress', () => {
     // retry once with the original model and surface the 200 to the client.
     const u = new URL(`${baseUrl}/v1/messages`);
     const payload = JSON.stringify({
-      model: 'claude-opus-4-7',
+      model: 'global.anthropic.claude-opus-4-7',
       messages: [{ role: 'user', content: 'what is npm?' }],
     });
     const res = await new Promise((resolve, reject) => {
@@ -345,20 +345,20 @@ describe('POST /v1/messages — router rewrite + egress', () => {
     });
     assert.equal(res.status, 200, 'retry should surface 200 to client');
     assert.equal(captured.length, 2, 'should make exactly two upstream calls');
-    assert.equal(captured[0].body.model, 'claude-haiku-4-5', 'first call uses router-chosen model');
-    assert.equal(captured[1].body.model, 'claude-opus-4-7', 'retry uses original model');
+    assert.equal(captured[0].body.model, 'global.anthropic.claude-haiku-4-5-20251001-v1:0', 'first call uses router-chosen model');
+    assert.equal(captured[1].body.model, 'global.anthropic.claude-opus-4-7', 'retry uses original model');
     const json = JSON.parse(res.body);
-    assert.equal(json.model, 'claude-opus-4-7');
+    assert.equal(json.model, 'global.anthropic.claude-opus-4-7');
   });
 
   it('does not retry when router did not rewrite the model', async () => {
-    // Send claude-sonnet-4-6 with a long non-planning message → router lands on
-    // default_tier=mid → claude-sonnet-4-6, so chosenModel === originalModel
+    // Send sonnet-4-7 with a long non-planning message → router lands on
+    // default_tier=mid → sonnet-4-7, so chosenModel === originalModel
     // and the 5xx fallback branch must be skipped (single upstream call).
     // Message must be >80 chars to avoid trivial_lookup classification.
     const u = new URL(`${baseUrl}/v1/messages`);
     const payload = JSON.stringify({
-      model: 'claude-sonnet-4-6',
+      model: 'global.anthropic.claude-sonnet-4-7',
       messages: [{
         role: 'user',
         content: 'Could you walk me through how the request handling layer connects to the storage subsystem and which module owns retries here.',
@@ -399,7 +399,7 @@ describe('POST /v1/messages — router rewrite + egress', () => {
     // that silently dropped it.
     const u = new URL(`${baseUrl}/v1/messages`);
     const payload = JSON.stringify({
-      model: 'claude-opus-4-7',
+      model: 'global.anthropic.claude-opus-4-7',
       stream: true,
       messages: [{ role: 'user', content: 'what is npm?' }],
     });
@@ -434,8 +434,8 @@ describe('POST /v1/messages — router rewrite + egress', () => {
     assert.match(res.body, /data: \{"type":"message_start"\}/);
     assert.match(res.body, /data: \{"type":"message_stop"\}/);
     assert.equal(captured.length, 2, 'should make exactly two upstream calls');
-    assert.equal(captured[0].body.model, 'claude-haiku-4-5', 'first call uses router-chosen model');
-    assert.equal(captured[1].body.model, 'claude-opus-4-7', 'retry uses original model');
+    assert.equal(captured[0].body.model, 'global.anthropic.claude-haiku-4-5-20251001-v1:0', 'first call uses router-chosen model');
+    assert.equal(captured[1].body.model, 'global.anthropic.claude-opus-4-7', 'retry uses original model');
   });
 
   it('replays drained 5xx body when retry itself throws', async () => {
@@ -447,7 +447,7 @@ describe('POST /v1/messages — router rewrite + egress', () => {
     // turn into a leaked envelope.
     const u = new URL(`${baseUrl}/v1/messages`);
     const payload = JSON.stringify({
-      model: 'claude-opus-4-7',
+      model: 'global.anthropic.claude-opus-4-7',
       messages: [{ role: 'user', content: 'what is npm?' }],
     });
     const res = await new Promise((resolve, reject) => {

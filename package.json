@@ -1,6 +1,6 @@
 {
   "name": "@evomap/evolver",
-  "version": "1.86.1",
+  "version": "1.87.0",
   "description": "A GEP-powered self-evolution engine for AI agents. Features automated log analysis and Genome Evolution Protocol (GEP) for auditable, reusable evolution assets.",
   "main": "index.js",
   "bin": {
@@ -20,7 +20,7 @@
   "license": "GPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/EvoMap/evolver.git"
+    "url": "https://github.com/EvoMap/evolver.git"
   },
   "homepage": "https://evomap.ai",
   "scripts": {
@@ -36,7 +36,8 @@
     "node": ">=22.12"
   },
   "dependencies": {
-    "@evomap/gep-sdk": "^1.3.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1053.0",
+    "@evomap/gep-sdk": "^1.5.0",
     "dotenv": "^16.4.7",
     "undici": "^7.0.0"
   },

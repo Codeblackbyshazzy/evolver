@@ -184,6 +184,49 @@ describe('loadGenes', () => {
     assert.equal(loaded.schema_version, undefined, 'must not synthesize schema_version');
     assert.equal(loaded.summary, undefined, 'must not synthesize summary');
   });
+
+  // PR #384 wired GeneRoutingHint through to the EvoX agent-core router,
+  // but for several months no shipped seed gene populated `routing_hint`
+  // — so RouterDecision.reason="gene_hint" never fired in the field. The
+  // first reduction in router-lessons-learned-2026-05-18.md §3 flagged
+  // this as the audit blocker for cost_tier follow-up. Pin explicit tier
+  // hints into the bundled `assets/gep/genes.json` so production installs
+  // (which receive it as `genes.seed.json` via build_public.js) start
+  // exercising the gene→router path without needing a fresh capsule.
+  //
+  // Important: this test must exercise the *production seed path*, not the
+  // last-resort `getDefaultGenes()` fallback. In production `npm i -g
+  // @evomap/evolver` ships the repo-root `assets/gep/genes.json` as
+  // `genes.seed.json`, and `ensureGenesSeeded()` copies it into the user's
+  // store on first run. The fallback only fires when neither file exists.
+  it('seed genes.json populates routing_hint reachable via prod ensureGenesSeeded path', () => {
+    const { genesPath, genesSeedPath, loadGenes } = freshRequire();
+    // Stage the real shipped seed (repo-root assets/gep/genes.json) as
+    // `genes.seed.json` in the test's GEP_ASSETS_DIR, mirroring what
+    // build_public.js does when packing the npm tarball. This forces the
+    // production code path: ensureGenesSeeded copies seed -> genes.json,
+    // and loadGenes reads from that, NOT from getDefaultGenes().
+    const repoSeed = path.join(__dirname, '..', 'assets', 'gep', 'genes.json');
+    fs.copyFileSync(repoSeed, genesSeedPath());
+    assert.ok(!fs.existsSync(genesPath()), 'precondition: no user genes.json yet');
+
+    const genes = loadGenes();
+    const integrity = genes.find(g => g.id === 'gene_tool_integrity');
+    assert.ok(integrity, 'gene_tool_integrity must ship in assets/gep/genes.json (prod seed)');
+    assert.deepEqual(integrity.routing_hint, { tier: 'cheap', reasoning_level: 'low' });
+
+    const distilled = genes.find(g => g.id === 'gene_distilled_s2g-env-vars');
+    assert.ok(distilled, 'gene_distilled_s2g-env-vars must ship in prod seed');
+    assert.deepEqual(distilled.routing_hint, { tier: 'cheap', reasoning_level: 'low' });
+    const { verifyAssetId } = require('../src/gep/contentHash');
+    assert.ok(verifyAssetId(distilled), 'shipped asset_id must verify against current content');
+
+    const optimize = genes.find(g => g.id === 'gene_gep_optimize_tool_usage');
+    assert.ok(optimize, 'gene_gep_optimize_tool_usage must ship in prod seed');
+    assert.deepEqual(optimize.routing_hint, { tier: 'mid', reasoning_level: 'medium' });
+
+    assert.ok(fs.existsSync(genesPath()), 'ensureGenesSeeded must have copied seed -> genes.json');
+  });
 });
 
 describe('readAllEvents', () => {

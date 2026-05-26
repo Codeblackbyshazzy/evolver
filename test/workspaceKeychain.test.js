@@ -9,6 +9,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { canCreateSymlinks } = require('./helpers/symlink');
+
+// Symlink-rejection tests need to plant a real symlink before exercising
+// the code under test; on Windows non-admin that fails with EPERM in
+// setup. Route those tests through `symlinkTest` which becomes a no-op
+// skip when symlink creation isn't available.
+const symlinkTest = canCreateSymlinks() ? test : test.skip;
 
 const PATHS_PATH = require.resolve('../src/gep/paths.js');
 const KEYCHAIN_PATH = require.resolve('../src/gep/workspaceKeychain.js');
@@ -225,7 +232,7 @@ describe('workspace-id keychain integration (issue #111 Phase 1)', () => {
   // through a symlinked `.evolver`, dropping the secret outside the
   // workspace. PR #109 round-2 HIGH originally hardened against this and
   // we must not regress.
-  test('refuses to write through a symlinked .evolver dir (Bugbot PR#121 round-1 HIGH; original PR#109 round-2 HIGH)', () => {
+  symlinkTest('refuses to write through a symlinked .evolver dir (Bugbot PR#121 round-1 HIGH; original PR#109 round-2 HIGH)', () => {
     process.env.EVOLVER_WORKSPACE_KEYCHAIN = 'off'; // exercise write path directly
     // Pre-place .evolver as a symlink to an attacker-controlled dir.
     const attackerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-111-attacker-'));
@@ -241,7 +248,7 @@ describe('workspace-id keychain integration (issue #111 Phase 1)', () => {
     try { fs.rmSync(attackerDir, { recursive: true, force: true }); } catch { /* */ }
   });
 
-  test('mode=auto with addon-hit MISS still refuses symlinked .evolver write', () => {
+  symlinkTest('mode=auto with addon-hit MISS still refuses symlinked .evolver write', () => {
     process.env.EVOLVER_WORKSPACE_KEYCHAIN = 'auto';
     const attackerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-111-attacker2-'));
     fs.symlinkSync(attackerDir, path.join(workspace, '.evolver'));

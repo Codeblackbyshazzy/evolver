@@ -9,6 +9,9 @@
 const { SCHEMA_VERSION } = require('../contentHash');
 
 const VALID_OUTCOME_STATUSES = ['success', 'failed'];
+const VALID_SOURCE_TYPES = ['generated', 'reused', 'reference', 'user_authored'];
+const VALID_VISIBILITIES = ['private', 'unlisted', 'public'];
+const VALID_COST_TIERS = ['cheap', 'standard', 'premium'];
 
 const CAPSULE_DEFAULTS = {
   type: 'Capsule',
@@ -32,6 +35,14 @@ const CAPSULE_DEFAULTS = {
   strategy: [],
   execution_trace: [],
   asset_id: null,
+  // Spec 1.8.0 §Appendix C user-authored fields. All default to null
+  // so a generated capsule emits the same on-wire shape it always has;
+  // /capsule save in evox sets these explicitly.
+  visibility: null,
+  scope: null,
+  cost_tier: null,
+  pack_of: null,
+  author: null,
 };
 
 // createCapsule: merge partial with defaults and normalize array/object fields.
@@ -73,6 +84,37 @@ function createCapsule(partial) {
   if (typeof c.schema_version !== 'string') c.schema_version = SCHEMA_VERSION;
   if (typeof c.confidence !== 'number')     c.confidence = 0;
 
+  // Normalize spec 1.8.0 §Appendix C fields. Schema declares
+  // additionalProperties:false so any unrecognized value here would
+  // fail validation downstream — coerce malformed inputs to null
+  // rather than letting them propagate.
+  if (c.visibility != null && !VALID_VISIBILITIES.includes(c.visibility)) {
+    c.visibility = null;
+  }
+  if (c.scope != null && !Array.isArray(c.scope)) {
+    c.scope = null;
+  } else if (Array.isArray(c.scope)) {
+    c.scope = c.scope.slice();
+  }
+  if (c.cost_tier != null && !VALID_COST_TIERS.includes(c.cost_tier)) {
+    c.cost_tier = null;
+  }
+  if (c.pack_of != null && !Array.isArray(c.pack_of)) {
+    c.pack_of = null;
+  } else if (Array.isArray(c.pack_of)) {
+    c.pack_of = c.pack_of.slice();
+  }
+  // author: schema requires both `handle` and `evox_install_id` when
+  // the field is present. A partial pair (e.g. handle without
+  // install_id) would fail schema validation, so drop it.
+  if (c.author != null) {
+    if (typeof c.author !== 'object' || !c.author.handle || !c.author.evox_install_id) {
+      c.author = null;
+    } else {
+      c.author = { handle: c.author.handle, evox_install_id: c.author.evox_install_id };
+    }
+  }
+
   return c;
 }
 
@@ -91,4 +133,12 @@ function validateCapsule(c) {
   return true;
 }
 
-module.exports = { createCapsule, validateCapsule, CAPSULE_DEFAULTS, VALID_OUTCOME_STATUSES };
+module.exports = {
+  createCapsule,
+  validateCapsule,
+  CAPSULE_DEFAULTS,
+  VALID_OUTCOME_STATUSES,
+  VALID_SOURCE_TYPES,
+  VALID_VISIBILITIES,
+  VALID_COST_TIERS,
+};

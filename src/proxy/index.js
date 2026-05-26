@@ -96,7 +96,22 @@ class EvoMapProxy {
     };
 
     const messagesHandler = buildMessagesHandler({
-      anthropicProxy: (reqPath, body, opts) => this._proxyAnthropic(reqPath, body, opts),
+      // Provider dispatch: EVOMAP_UPSTREAM read per-request (matches the
+      // hot-swap policy used for ANTHROPIC_API_KEY at line 266 below).
+      // Default 'anthropic' keeps the existing path byte-for-byte; 'bedrock'
+      // forwards via AWS Bedrock InvokeModel/InvokeModelWithResponseStream
+      // and re-emits standard SSE so the client contract is unchanged.
+      anthropicProxy: (reqPath, body, opts) => {
+        // Mode is decided once per request in messages_route.js (the same
+        // place the auth gate reads it), then passed in via opts.upstreamMode.
+        // This makes the gate decision and the routing decision share one
+        // env read, so a hot-swap of EVOMAP_UPSTREAM mid-request can't make
+        // them disagree (e.g. gate skipped but request still hits Anthropic).
+        const mode = opts?.upstreamMode || 'anthropic';
+        return mode === 'bedrock'
+          ? this._proxyBedrock(reqPath, body, opts)
+          : this._proxyAnthropic(reqPath, body, opts);
+      },
       logger: this.logger,
     });
 
@@ -289,6 +304,216 @@ class EvoMapProxy {
       json: isStream ? null : () => res.json(),
       text: () => res.text(),
     };
+  }
+
+  // Bedrock upstream mode: same return contract as _proxyAnthropic so
+  // messages_route.js and ProxyHttpServer._streamResponse don't change.
+  // Body transformation: model -> URL path; inject anthropic_version;
+  // strip top-level model so Bedrock InvokeModel doesn't 400. SDK owns
+  // SigV4 signing (creds via AWS_* env or opts.bedrockCredentials for
+  // tests) and AWS event-stream binary decoding; we only re-emit each
+  // chunk as standard SSE so clients remain Anthropic-compatible.
+  async _proxyBedrock(reqPath, body, opts = {}) {
+    if (!this._bedrockSdk) {
+      this._bedrockSdk = require('@aws-sdk/client-bedrock-runtime');
+    }
+    const {
+      BedrockRuntimeClient,
+      InvokeModelCommand,
+      InvokeModelWithResponseStreamCommand,
+    } = this._bedrockSdk;
+
+    const modelId = body && typeof body.model === 'string' ? body.model : null;
+    if (!modelId) {
+      const errBody = JSON.stringify({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: 'body.model required for Bedrock upstream' },
+      });
+      return {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+        stream: null,
+        json: () => JSON.parse(errBody),
+        text: () => errBody,
+      };
+    }
+
+    const upstreamBody = { ...body };
+    delete upstreamBody.model;
+    if (!upstreamBody.anthropic_version) {
+      upstreamBody.anthropic_version = 'bedrock-2023-05-31';
+    }
+    const wantsStream = upstreamBody.stream === true;
+    // Bedrock infers stream-vs-not from the command, not the body field.
+    delete upstreamBody.stream;
+
+    // Claude Code v2.1.150+ sends `thinking: { type: 'adaptive' }` for Opus
+    // 4.7+. Bedrock InvokeModel only accepts 'enabled' | 'disabled' on the
+    // 4.5/4.1 generation deployed there, returning 400. Fold 'adaptive':
+    //
+    // Two hard constraints collide:
+    //   - Anthropic: budget_tokens >= 1024 when thinking is enabled
+    //   - Bedrock:   budget_tokens <  max_tokens (strictly)
+    //
+    // For max_tokens <= 1024 there's no valid budget at all (1024 floor
+    // would fail Bedrock's strict-less-than check), so we have to drop
+    // thinking entirely on those calls — fold to 'disabled'. For larger
+    // max_tokens we default to max_tokens/2 (the model picks budget in
+    // adaptive mode, but Bedrock 'enabled' requires the field).
+    if (upstreamBody.thinking && upstreamBody.thinking.type === 'adaptive') {
+      const maxTokens = typeof upstreamBody.max_tokens === 'number' ? upstreamBody.max_tokens : 8192;
+      const haveBudget = typeof upstreamBody.thinking.budget_tokens === 'number';
+      if (!haveBudget && maxTokens <= 1024) {
+        upstreamBody.thinking = { type: 'disabled' };
+      } else {
+        upstreamBody.thinking = {
+          ...upstreamBody.thinking,
+          type: 'enabled',
+          budget_tokens: haveBudget ? upstreamBody.thinking.budget_tokens : Math.max(1024, Math.floor(maxTokens / 2)),
+        };
+      }
+    }
+
+    // Claude Code v2.1.150+ adds top-level fields the Anthropic API accepts
+    // but Bedrock InvokeModel doesn't ("Extra inputs are not permitted"):
+    //   - output_config: { effort }      (when effortLevel is set)
+    //   - context_management: { ... }    (auto context window management)
+    // Bedrock's strict schema means any unknown top-level field 400s the
+    // whole call, so strip the known CC additions before forwarding. New CC
+    // fields will surface as 400s and need to be added here.
+    for (const k of ['output_config', 'context_management']) {
+      if (k in upstreamBody) delete upstreamBody[k];
+    }
+
+    // Cache the BedrockRuntimeClient across requests so its connection
+    // pool, DNS cache, and credential-chain resolution amortize. Reusing
+    // a single client matches what _proxyAnthropic does with the global
+    // fetch + Agent. Cache key includes the SDK module identity so test
+    // SDK injection (proxy._bedrockSdk = mock) invalidates correctly.
+    const clientArgs = {
+      region: opts.bedrockRegion || process.env.AWS_REGION || 'us-east-1',
+      ...(opts.bedrockEndpoint || process.env.EVOMAP_BEDROCK_ENDPOINT
+        ? { endpoint: opts.bedrockEndpoint || process.env.EVOMAP_BEDROCK_ENDPOINT }
+        : {}),
+      ...(opts.bedrockCredentials ? { credentials: opts.bedrockCredentials } : {}),
+    };
+    const cacheKey = JSON.stringify(clientArgs);
+    if (
+      !this._bedrockClient
+      || this._bedrockClientKey !== cacheKey
+      || this._bedrockClientSdk !== this._bedrockSdk
+    ) {
+      this._bedrockClient = new BedrockRuntimeClient(clientArgs);
+      this._bedrockClientKey = cacheKey;
+      this._bedrockClientSdk = this._bedrockSdk;
+    }
+    const client = this._bedrockClient;
+
+    // Match _proxyAnthropic's per-request timeout boundary so a hung
+    // upstream can't pin a Bedrock connection forever. AWS SDK v3
+    // commands accept abortSignal in the second arg.
+    const timeoutMs = opts.timeoutMs || 60_000;
+    const abortController = new AbortController();
+    const abortTimer = setTimeout(() => abortController.abort(), timeoutMs);
+
+    try {
+      if (wantsStream) {
+        const out = await client.send(new InvokeModelWithResponseStreamCommand({
+          modelId,
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify(upstreamBody),
+        }), { abortSignal: abortController.signal });
+        // The timeout that bounds the initial send must not apply to the
+        // streaming body — chunks arrive over many seconds. Clear it now;
+        // the readable-stream's cancel() handler is what closes the
+        // upstream when the client disconnects mid-stream.
+        clearTimeout(abortTimer);
+        const stream = new ReadableStream({
+          async start(controller) {
+            const enc = new TextEncoder();
+            try {
+              for await (const event of out.body) {
+                if (event.chunk?.bytes) {
+                  const json = Buffer.from(event.chunk.bytes).toString('utf8');
+                  controller.enqueue(enc.encode(`data: ${json}\n\n`));
+                  continue;
+                }
+                // Bedrock InvokeModelWithResponseStream may emit any of these
+                // exception envelopes mid-stream; missing one silently drops
+                // it and closes the stream without an error frame, so the
+                // client sees a truncated-but-clean response.
+                const ex = event.internalServerException
+                  || event.modelStreamErrorException
+                  || event.throttlingException
+                  || event.validationException
+                  || event.modelTimeoutException
+                  || event.serviceUnavailableException;
+                if (ex) {
+                  const errFrame = JSON.stringify({
+                    type: 'error',
+                    error: { type: ex.name || 'upstream_error', message: ex.message || String(ex) },
+                  });
+                  controller.enqueue(enc.encode(`event: error\ndata: ${errFrame}\n\n`));
+                }
+              }
+              controller.close();
+            } catch (err) {
+              controller.error(err);
+            }
+          },
+          // ProxyHttpServer._streamResponse calls reader.cancel() when the
+          // downstream HTTP client disconnects. Without this, the AWS
+          // event-stream AsyncIterable keeps pulling frames into a
+          // discarded ReadableStream, leaking the underlying HTTP/2
+          // stream + socket out of the SDK's pool.
+          cancel() {
+            try {
+              if (typeof out.body?.return === 'function') {
+                out.body.return();
+              }
+            } catch { /* AsyncIterable already closed */ }
+          },
+        });
+        return {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+          stream,
+          json: null,
+          text: null,
+        };
+      }
+
+      const out = await client.send(new InvokeModelCommand({
+        modelId,
+        contentType: 'application/json',
+        accept: 'application/json',
+        body: JSON.stringify(upstreamBody),
+      }), { abortSignal: abortController.signal });
+      clearTimeout(abortTimer);
+      const text = Buffer.from(out.body).toString('utf8');
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        stream: null,
+        json: () => JSON.parse(text),
+        text: () => text,
+      };
+    } catch (err) {
+      clearTimeout(abortTimer);
+      const status = err.$metadata?.httpStatusCode || 500;
+      const errBody = JSON.stringify({
+        type: 'error',
+        error: { type: err.name || 'upstream_error', message: err.message || String(err) },
+      });
+      return {
+        status,
+        headers: { 'content-type': 'application/json' },
+        stream: null,
+        json: () => JSON.parse(errBody),
+        text: () => errBody,
+      };
+    }
   }
 
   async _getHubMailboxStatus() {

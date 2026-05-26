@@ -195,6 +195,7 @@ function getDefaultGenes() {
           'node scripts/validate-suite.js',
         ],
         anti_patterns: ['tool_bypass'],
+        routing_hint: { tier: 'cheap', reasoning_level: 'low' },
       },
     ],
   };

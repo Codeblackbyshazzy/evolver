@@ -3,6 +3,12 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { canCreateSymlinks } = require('./helpers/symlink');
+
+// Symlink-rejection tests need to plant a real symlink before exercising
+// the code under test; on Windows non-admin that fails with EPERM in
+// setup. Skip those tests when symlink creation isn't available.
+const symlinkIt = canCreateSymlinks() ? it : it.skip;
 
 const hookAdapter = require('../src/adapters/hookAdapter');
 const opencodeAdapter = require('../src/adapters/opencode');
@@ -351,7 +357,7 @@ describe('opencode adapter: isEvolverManagedPluginFile', () => {
 // that owns *two* nested subdirs (`hooks/` for the shared scripts, `plugins/`
 // for the auto-generated evolver.js). Both must be guarded.
 describe('opencode adapter: rejects symlinked nested subdirs (PR #94 round-5)', () => {
-  it('install refuses symlinked .opencode/hooks', () => {
+  symlinkIt('install refuses symlinked .opencode/hooks', () => {
     const tmp = makeTmpDir();
     try {
       const realConfig = path.join(tmp, '.opencode');
@@ -367,7 +373,7 @@ describe('opencode adapter: rejects symlinked nested subdirs (PR #94 round-5)', 
     } finally { cleanup(tmp); }
   });
 
-  it('install refuses symlinked .opencode/plugins', () => {
+  symlinkIt('install refuses symlinked .opencode/plugins', () => {
     const tmp = makeTmpDir();
     try {
       const realConfig = path.join(tmp, '.opencode');
@@ -383,7 +389,7 @@ describe('opencode adapter: rejects symlinked nested subdirs (PR #94 round-5)', 
     } finally { cleanup(tmp); }
   });
 
-  it('uninstall refuses symlinked nested dirs', () => {
+  symlinkIt('uninstall refuses symlinked nested dirs', () => {
     const tmp = makeTmpDir();
     try {
       const realConfig = path.join(tmp, '.opencode');

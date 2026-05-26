@@ -143,7 +143,11 @@
       "validation": [
         "node scripts/validate-modules.js ./src/gep/signals ./src/evolve",
         "node scripts/validate-suite.js"
-      ]
+      ],
+      "routing_hint": {
+        "tier": "mid",
+        "reasoning_level": "medium"
+      }
     },
     {
       "type": "Gene",
@@ -178,6 +182,10 @@
       "validation": [
         "node --version"
       ],
+      "routing_hint": {
+        "tier": "cheap",
+        "reasoning_level": "low"
+      },
       "schema_version": "1.6.0",
       "_source": {
         "kind": "skill2gep",
@@ -197,7 +205,41 @@
           "preconditions_extracted": 0
         }
       },
-      "asset_id": "sha256:4fa74fe34d19564416dfd8e63f3012a1672e86f39c4bff85d1c70524e06b5a2e"
+      "asset_id": "sha256:1501bc37fbefb18630c4dc8a95d8cdc1ed32bec4a465dc3223280ae907e07297"
+    },
+    {
+      "type": "Gene",
+      "id": "gene_tool_integrity",
+      "category": "repair",
+      "signals_match": [
+        "tool_bypass|工具绕过|ツール迂回|도구우회"
+      ],
+      "preconditions": [
+        "agent used shell/exec to perform an action that a registered tool can handle"
+      ],
+      "strategy": [
+        "Always prefer registered tools over ad-hoc scripts or shell workarounds",
+        "If a registered tool fails, report the actual error honestly and attempt to fix the root cause",
+        "Never fabricate explanations -- describe actual actions transparently",
+        "Do not create temporary scripts in extension or project directories"
+      ],
+      "constraints": {
+        "max_files": 4,
+        "forbidden_paths": [
+          ".git",
+          "node_modules"
+        ]
+      },
+      "validation": [
+        "node scripts/validate-suite.js"
+      ],
+      "anti_patterns": [
+        "tool_bypass"
+      ],
+      "routing_hint": {
+        "tier": "cheap",
+        "reasoning_level": "low"
+      }
     }
   ]
 }

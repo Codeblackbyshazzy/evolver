@@ -2,6 +2,20 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const { canCreateSymlinks, canMakeDirReadOnly } = require('./helpers/symlink');
+
+// Symlink-rejection tests need to plant a real symlink before exercising
+// the code under test; on Windows non-admin that fails with EPERM in
+// setup. Skip those tests when symlink creation isn't available.
+const symlinkIt = canCreateSymlinks() ? it : it.skip;
+
+// Tests that rely on `chmod 0o555` actually preventing writes need a
+// filesystem that honours POSIX mode bits. Windows accepts the chmod
+// call but the owning user still writes through it, so the assertion
+// the test wants to make (getWorkspaceId returns null when it can't
+// persist the secret → reader falls back to legacy cwd-only entries)
+// is observed against the wrong state.
+const readOnlyDirIt = canMakeDirReadOnly() ? it : it.skip;
 
 const collect = require('../src/evolve/pipeline/collect');
 
@@ -135,19 +149,30 @@ describe('readMemorySnippet / readUserSnippet / readRealSessionLog fallback (#54
         sess: collect.readRealSessionLog(),
       }));
     `;
+    // Cross-platform homedir: `os.homedir()` reads HOME on POSIX but
+    // USERPROFILE on Windows. The user-level memory_graph fallback in
+    // src/evolve/pipeline/collect.js calls `os.homedir()` directly, so
+    // setting only HOME (as the original test setup did) left Windows
+    // runs falling back to the developer's real $USERPROFILE instead
+    // of the test fixture — every workspace-id scoping test then
+    // returned `[MEMORY.md MISSING]` because the seeded fixture file
+    // wasn't where the reader looked. Mirror HOME into USERPROFILE so
+    // the same test passes on both platforms.
+    const childEnv = {
+      ...process.env,
+      EVOLVER_REPO_ROOT: repoRoot,
+      EVOLVER_NO_PARENT_GIT: 'true',
+      EVOLVER_QUIET_PARENT_GIT: '1',
+      EVOLVER_SESSION_SOURCE: 'cursor',
+      EVOLVER_CURSOR_TRANSCRIPTS_DIR: path.join(repoRoot, '__nope__'),
+      OPENCLAW_WORKSPACE: repoRoot,
+      AGENT_SESSIONS_DIR: path.join(repoRoot, '__nope__'),
+      HOME: repoRoot,
+      ...env,
+    };
+    childEnv.USERPROFILE = childEnv.HOME;
     const res = spawnSync(process.execPath, ['-e', script], {
-      env: {
-        ...process.env,
-        EVOLVER_REPO_ROOT: repoRoot,
-        EVOLVER_NO_PARENT_GIT: 'true',
-        EVOLVER_QUIET_PARENT_GIT: '1',
-        EVOLVER_SESSION_SOURCE: 'cursor',
-        EVOLVER_CURSOR_TRANSCRIPTS_DIR: path.join(repoRoot, '__nope__'),
-        OPENCLAW_WORKSPACE: repoRoot,
-        AGENT_SESSIONS_DIR: path.join(repoRoot, '__nope__'),
-        HOME: repoRoot,
-        ...env,
-      },
+      env: childEnv,
       encoding: 'utf8',
     });
     if (res.status !== 0) {
@@ -378,7 +403,15 @@ describe('readMemorySnippet / readUserSnippet / readRealSessionLog fallback (#54
     } finally { rmTmp(tmp); }
   });
 
-  it('returns null fallback when graph contains only non-outcome events', () => {
+  it('graph with only non-outcome events still suppresses session_logs_missing / user_missing (#540 follow-up)', () => {
+    // Original #540 contract: README promises that as `memory_graph.jsonl`
+    // accumulates, the three advisory signals quiet down. The first round of
+    // the fix only honored that for *outcome* records, which left a fresh
+    // Codex install (signals/hypotheses written every cycle, but no
+    // session-end hook firing yet) with `user_missing` /
+    // `session_logs_missing` still raised — exactly what rendigua re-tested
+    // on 1.86.0. This test pins down the broader contract: graph file
+    // present + any parseable entry => no MISSING placeholders for usr/sess.
     const tmp = mkTmp();
     try {
       const evoDir = path.join(tmp, 'memory', 'evolution');
@@ -393,9 +426,20 @@ describe('readMemorySnippet / readUserSnippet / readRealSessionLog fallback (#54
         'utf8'
       );
       const out = runInChild(tmp);
-      // No outcome anywhere -> reader returns null -> caller emits legacy MISSING.
+      // readMemorySnippet's fallback chain is unchanged — it requires an
+      // AGENTS.md marker or USER/MEMORY.md, neither of which exist here.
       assert.equal(out.mem, '[MEMORY.md MISSING]');
-      assert.equal(out.sess, '[NO SESSION LOGS FOUND]');
+      // readUserSnippet and _sessionLogFallback now honor the graph-any-tail
+      // tier, so neither must contain the literal MISSING strings that
+      // signals.js (gep/signals.js:348-351) keys on.
+      assert.ok(!/USER\.md MISSING/i.test(out.usr),
+        `out.usr must not be the legacy MISSING placeholder when graph is accumulating: ${out.usr}`);
+      assert.ok(!/no session logs found/i.test(out.sess),
+        `out.sess must not be the legacy MISSING placeholder when graph is accumulating: ${out.sess}`);
+      // Both should reference the any-tail summary so the reviewer model
+      // sees the genuine evidence the graph is filling up.
+      assert.match(out.usr, /memory_graph\.jsonl/);
+      assert.match(out.sess, /memory_graph\.jsonl/);
     } finally { rmTmp(tmp); }
   });
 
@@ -580,7 +624,7 @@ describe('readMemorySnippet / readUserSnippet / readRealSessionLog fallback (#54
     } finally { rmTmp(root); }
   });
 
-  it('refuses to follow a symlinked .evolver/workspace-id (Bugbot PR#109 round-2 HIGH)', () => {
+  symlinkIt('refuses to follow a symlinked .evolver/workspace-id (Bugbot PR#109 round-2 HIGH)', () => {
     // A malicious repo can pre-place `.evolver/workspace-id` as a
     // symlink to an attacker-chosen file. Without O_NOFOLLOW + lstat
     // checks, the writer would clobber the linked file with the secret
@@ -623,7 +667,7 @@ describe('readMemorySnippet / readUserSnippet / readRealSessionLog fallback (#54
     } finally { rmTmp(root); }
   });
 
-  it('legacy cwd-only entries are accepted only when current workspace has no secret', () => {
+  readOnlyDirIt('legacy cwd-only entries are accepted only when current workspace has no secret', () => {
     // Backward compat: a workspace with no `.evolver/workspace-id`
     // (e.g. a read-only fixture or a freshly-checked-out clone before
     // any session has run) still benefits from the cwd-tag scope.
@@ -806,6 +850,48 @@ describe('e2e #540: collect.js outputs through signals.js should suppress 3 advi
     } finally { rmTmp(tmp); }
   });
 
+  it('rendigua 1.86.0 retest scenario (marker + graph with only non-outcome events) emits 0 of the 3 advisories (#540 follow-up)', () => {
+    // Direct reproduction of rendigua's 2026-05-25 retest report on
+    // EvoMap/evolver issue #540 comment 4536472157:
+    //   - .codex dir present
+    //   - AGENTS.md with `<!-- evolver-evolution-memory -->` marker
+    //   - memory_graph.jsonl tail (but only signal/hypothesis/attempt
+    //     entries — no outcome records yet, since session-end hook
+    //     hasn't fired with a completed cycle)
+    //   - no MEMORY.md, no USER.md, no platform session log
+    // The earlier #540 fix quieted memory_missing only; user_missing and
+    // session_logs_missing kept firing because both fallback chains
+    // strictly required outcome entries.
+    const tmp = mkTmp();
+    try {
+      fs.mkdirSync(path.join(tmp, '.codex', 'sessions'), { recursive: true });
+      fs.writeFileSync(path.join(tmp, 'AGENTS.md'),
+        '# Project Agents\n\n<!-- evolver-evolution-memory -->\n## Evolution Memory\nrecent: 3 cycles\n\n## Other\nx\n',
+        'utf8');
+      const evoDir = path.join(tmp, 'memory', 'evolution');
+      fs.mkdirSync(evoDir, { recursive: true });
+      fs.writeFileSync(path.join(evoDir, 'memory_graph.jsonl'),
+        JSON.stringify({ kind: 'signal',     ts: '2026-05-25T00:00:00Z', signal: { signals: ['perf_bottleneck'] } }) + '\n' +
+        JSON.stringify({ kind: 'hypothesis', ts: '2026-05-25T00:01:00Z', signal: { signals: ['perf_bottleneck'] } }) + '\n' +
+        JSON.stringify({ kind: 'attempt',    ts: '2026-05-25T00:02:00Z' }) + '\n',
+        'utf8');
+
+      const out = runCollectInChild(tmp);
+      const signals = extractSignals({
+        recentSessionTranscript: out.sess,
+        todayLog: '',
+        memorySnippet: out.mem,
+        userSnippet: out.usr,
+        recentEvents: [],
+      });
+
+      const advisories = ['memory_missing', 'user_missing', 'session_logs_missing'];
+      const fired = signals.filter((s) => advisories.includes(s));
+      assert.deepEqual(fired, [],
+        `rendigua scenario must raise 0 advisories, got: ${JSON.stringify(fired)}; full signals=${JSON.stringify(signals)}; usr=${out.usr}; sess=${out.sess}`);
+    } finally { rmTmp(tmp); }
+  });
+
   it('truly-empty setup (no MD, no marker, no memory_graph) preserves all 3 advisories for legacy users', () => {
     const tmp = mkTmp();
     try {
@@ -834,5 +920,278 @@ describe('e2e #540: collect.js outputs through signals.js should suppress 3 advi
       assert.ok(signals.includes('session_logs_missing'),
         `session_logs_missing must fire in empty scenario, signals=${JSON.stringify(signals)}`);
     } finally { rmTmp(tmp); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #543: Codex session log auto-discovery
+//
+// Before this fix, the only way `readCursorTranscripts()` would read
+// anything was if the user manually exported `EVOLVER_CURSOR_TRANSCRIPTS_DIR`.
+// A fresh Codex install therefore reported "[NO SESSION LOGS FOUND]" on
+// every cycle even though Codex was writing rollouts to ~/.codex/sessions/.
+// The auto-discovery in `resolveTranscriptDirs()` now picks up the
+// default platform paths so the common case "just works".
+// ---------------------------------------------------------------------------
+describe('Codex / Claude session-log auto-discovery (#543)', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { spawnSync } = require('child_process');
+
+  function mkTmpHome() {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-543-'));
+  }
+  function rmTmpHome(dir) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+
+  // Spawn a child node process with a pinned HOME so `os.homedir()`
+  // resolves to the fixture. The reader's module-level constants
+  // (`CURSOR_TRANSCRIPTS_DIR` from env, `AGENT_SESSIONS_DIR` from
+  // `getAgentSessionsDir()`) are evaluated at require() time, so we
+  // can't just override `process.env` in the parent process.
+  function runReaderInChild(home, extraEnv) {
+    const script = `
+      const collect = require(${JSON.stringify(path.resolve(__dirname, '..', 'src', 'evolve', 'pipeline', 'collect.js'))});
+      process.stdout.write(collect.readRealSessionLog());
+    `;
+    const env = {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      EVOLVER_REPO_ROOT: home,
+      EVOLVER_NO_PARENT_GIT: 'true',
+      EVOLVER_QUIET_PARENT_GIT: '1',
+      EVOLVER_SESSION_SOURCE: 'cursor',
+      OPENCLAW_WORKSPACE: home,
+      AGENT_SESSIONS_DIR: path.join(home, '__no-openclaw__'),
+      // Make sure the explicit override does NOT win for these tests —
+      // we're exercising the new default-discovery path.
+      EVOLVER_CURSOR_TRANSCRIPTS_DIR: '',
+      ...(extraEnv || {}),
+    };
+    const res = spawnSync(process.execPath, ['-e', script], { env, encoding: 'utf8' });
+    if (res.status !== 0) throw new Error('child failed: ' + (res.stderr || res.stdout));
+    return res.stdout;
+  }
+
+  function writeCodexRollout(home, dateStr, lines) {
+    // Layout mirrors what `~/.codex/sessions/` actually contains:
+    // YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl
+    const [yyyy, mm, dd] = dateStr.split('-');
+    const dir = path.join(home, '.codex', 'sessions', yyyy, mm, dd);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `rollout-${dateStr}T11-42-17-test-${Math.random().toString(36).slice(2, 8)}.jsonl`);
+    fs.writeFileSync(file, lines.map(JSON.stringify).join('\n') + '\n');
+    return file;
+  }
+
+  it('resolveTranscriptDirs auto-discovers ~/.codex/sessions when no env override is set', () => {
+    const { resolveTranscriptDirs } = require('../src/evolve/utils');
+    const home = mkTmpHome();
+    try {
+      fs.mkdirSync(path.join(home, '.codex', 'sessions'), { recursive: true });
+      const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
+      assert.equal(dirs.length, 1, `expected 1 dir, got ${JSON.stringify(dirs)}`);
+      assert.ok(dirs[0].endsWith(path.join('.codex', 'sessions')),
+        `expected ~/.codex/sessions, got ${dirs[0]}`);
+    } finally { rmTmpHome(home); }
+  });
+
+  it('resolveTranscriptDirs picks up both Codex and Claude when both exist', () => {
+    const { resolveTranscriptDirs } = require('../src/evolve/utils');
+    const home = mkTmpHome();
+    try {
+      fs.mkdirSync(path.join(home, '.codex', 'sessions'), { recursive: true });
+      fs.mkdirSync(path.join(home, '.claude', 'projects'), { recursive: true });
+      const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
+      assert.equal(dirs.length, 2);
+      assert.ok(dirs.some(d => d.includes('.codex')));
+      assert.ok(dirs.some(d => d.includes('.claude')));
+    } finally { rmTmpHome(home); }
+  });
+
+  it('resolveTranscriptDirs honors EVOLVER_CURSOR_TRANSCRIPTS_DIR override (override wins over defaults)', () => {
+    const { resolveTranscriptDirs } = require('../src/evolve/utils');
+    const home = mkTmpHome();
+    try {
+      fs.mkdirSync(path.join(home, '.codex', 'sessions'), { recursive: true });
+      const override = path.join(home, 'custom-transcripts');
+      fs.mkdirSync(override, { recursive: true });
+      const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: override });
+      assert.deepEqual(dirs, [override],
+        'explicit override must short-circuit default discovery');
+    } finally { rmTmpHome(home); }
+  });
+
+  it('resolveTranscriptDirs returns empty when no platform dirs exist and no override', () => {
+    const { resolveTranscriptDirs } = require('../src/evolve/utils');
+    const home = mkTmpHome();
+    try {
+      const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
+      assert.deepEqual(dirs, []);
+    } finally { rmTmpHome(home); }
+  });
+
+  it('readRealSessionLog picks up a Codex rollout JSONL with no env override (#543 end-to-end)', () => {
+    const home = mkTmpHome();
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      writeCodexRollout(home, today, [
+        { type: 'session_meta', payload: { cwd: home } },
+        { type: 'item.added', item: { type: 'message', role: 'user',
+            content: [{ type: 'input_text', text: 'how do I fix this auth bug?' }] } },
+        { type: 'item.added', item: { type: 'message', role: 'assistant',
+            content: [{ type: 'output_text', text: 'Let me check the auth module.' }] } },
+        { type: 'item.added', item: { type: 'function_call', name: 'read_file', call_id: 'c1' } },
+      ]);
+      const out = runReaderInChild(home);
+      assert.ok(!out.includes('[NO SESSION LOGS FOUND]'),
+        `Codex rollout was not picked up; readRealSessionLog returned:\n${out}`);
+      assert.match(out, /USER.*auth bug/, `expected USER message in output:\n${out}`);
+      assert.match(out, /ASSISTANT.*auth module/, `expected ASSISTANT message in output:\n${out}`);
+      assert.match(out, /\[TOOL: read_file\]/, `expected function_call rendering in output:\n${out}`);
+    } finally { rmTmpHome(home); }
+  });
+
+  // Bugbot PR#130 Agentic Security Review (MEDIUM): the auto-discovery path
+  // pulls transcripts from a user-level dir that holds sessions from EVERY
+  // project the user has touched. Without a workspace filter, evolver
+  // running on project A would import session content from an unrelated
+  // project B — cross-project context contamination + possible disclosure
+  // of prior session data.
+  it('rejects Codex rollouts whose session_meta cwd is a different workspace (Bugbot PR#130 Security MEDIUM)', () => {
+    const home = mkTmpHome();
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      // Alien session — different cwd, sensitive-looking content. With the
+      // workspace-cwd filter in place this must NOT appear in the reader
+      // output, even though it lives in the same auto-discovered
+      // ~/.codex/sessions tree.
+      writeCodexRollout(home, today, [
+        { type: 'session_meta', payload: { cwd: '/home/other-user/secret-project' } },
+        { type: 'item.added', item: { type: 'message', role: 'user',
+            content: [{ type: 'input_text', text: 'ALIEN_PROJECT_CANARY production credentials' }] } },
+      ]);
+      // Plus a legitimate session for our workspace — sanity check that
+      // the filter doesn't collapse to "include nothing".
+      writeCodexRollout(home, today, [
+        { type: 'session_meta', payload: { cwd: home } },
+        { type: 'item.added', item: { type: 'message', role: 'user',
+            content: [{ type: 'input_text', text: 'OWN_PROJECT_OK refactor request' }] } },
+      ]);
+      const out = runReaderInChild(home);
+      assert.doesNotMatch(out, /ALIEN_PROJECT_CANARY/,
+        `cross-project transcript leaked into reader output:\n${out}`);
+      assert.match(out, /OWN_PROJECT_OK/,
+        `own-workspace transcript was filtered out by mistake:\n${out}`);
+    } finally { rmTmpHome(home); }
+  });
+
+  it('rejects transcripts with no session_meta cwd at all (fail-closed when provenance is unknown)', () => {
+    const home = mkTmpHome();
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      // No session_meta line — only message records. With no recognisable
+      // cwd we can't prove provenance, so the file must be dropped from
+      // auto-discovery (fail-closed). An operator who needs to read such
+      // transcripts can still point EVOLVER_CURSOR_TRANSCRIPTS_DIR at the
+      // dir; that explicit override bypasses the filter.
+      writeCodexRollout(home, today, [
+        { type: 'item.added', item: { type: 'message', role: 'user',
+            content: [{ type: 'input_text', text: 'NO_META_CANARY some content' }] } },
+      ]);
+      const out = runReaderInChild(home);
+      assert.doesNotMatch(out, /NO_META_CANARY/,
+        `transcript with no session_meta cwd was included; filter should fail-closed:\n${out}`);
+    } finally { rmTmpHome(home); }
+  });
+
+  it('explicit EVOLVER_CURSOR_TRANSCRIPTS_DIR override bypasses the workspace filter', () => {
+    const home = mkTmpHome();
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      // Same alien-cwd content as the contamination test, but this time
+      // the operator explicitly points us at the dir. Override semantics:
+      // they assert it belongs to this workspace (e.g. moved repo, or
+      // container path != host path), so the filter must NOT drop the
+      // file even though session_meta.cwd doesn't match the workspace.
+      writeCodexRollout(home, today, [
+        { type: 'session_meta', payload: { cwd: '/some/other/path' } },
+        { type: 'item.added', item: { type: 'message', role: 'user',
+            content: [{ type: 'input_text', text: 'OVERRIDE_PATH_CANARY in container' }] } },
+      ]);
+      const overrideDir = path.join(home, '.codex', 'sessions');
+      const out = runReaderInChild(home, { EVOLVER_CURSOR_TRANSCRIPTS_DIR: overrideDir });
+      assert.match(out, /OVERRIDE_PATH_CANARY/,
+        `explicit override should bypass the workspace-cwd filter:\n${out}`);
+    } finally { rmTmpHome(home); }
+  });
+
+  // Follow-up to #543 (tammypi's screenshot reply): user reported that
+  // even after setting EVOLVER_CURSOR_TRANSCRIPTS_DIR (the documented
+  // workaround) evolver still emitted "No real session logs were
+  // found". Local repro pinpointed it to the workspace-cwd filter
+  // added in the same PR as the Bugbot security hardening:
+  //
+  //   - User runs `evolver run` from /home/u/workspace/foo (no
+  //     `git init` done there yet).
+  //   - `getRepoRoot()` walks up, finds no `.git`, falls through to
+  //     the evolver install dir.
+  //   - `WORKSPACE_ROOT` therefore points at the evolver install,
+  //     NOT at /home/u/workspace/foo.
+  //   - Codex session's `session_meta.payload.cwd` is
+  //     /home/u/workspace/foo (the real cwd at session time).
+  //   - Filter compares the two, mismatches, drops every file.
+  //
+  // Fix: match the session cwd against MULTIPLE workspace identities
+  // (WORKSPACE_ROOT, process.cwd(), EVOLVER_REPO_ROOT). process.cwd()
+  // catches this case because the user actually stood in
+  // /home/u/workspace/foo when invoking evolver — same path Codex
+  // recorded.
+  it('reads own-workspace transcripts even when the workspace has no .git (#543 follow-up)', () => {
+    const home = mkTmpHome();
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      // Workspace dir exists but no `.git`. The transcript's recorded
+      // cwd matches the workspace path; without the multi-candidate
+      // match this transcript was silently dropped.
+      writeCodexRollout(home, today, [
+        { type: 'session_meta', payload: { cwd: home } },
+        { type: 'item.added', item: { type: 'message', role: 'user',
+            content: [{ type: 'input_text', text: 'NO_GIT_CANARY refactor request' }] } },
+      ]);
+      // Direct spawnSync so we can pin process.cwd() to `home` AND
+      // null out the env shortcuts (EVOLVER_REPO_ROOT / OPENCLAW_WORKSPACE)
+      // that runReaderInChild always sets. The combination forces
+      // `getRepoRoot()` to fall through to its install-dir fallback,
+      // matching tammypi's reported configuration exactly.
+      const script = `
+        const collect = require(${JSON.stringify(require('path').resolve(__dirname, '..', 'src', 'evolve', 'pipeline', 'collect.js'))});
+        process.stdout.write(collect.readRealSessionLog());
+      `;
+      const res = spawnSync(process.execPath, ['-e', script], {
+        cwd: home,
+        env: {
+          ...process.env,
+          HOME: home,
+          USERPROFILE: home,
+          EVOLVER_REPO_ROOT: '',
+          OPENCLAW_WORKSPACE: '',
+          EVOLVER_NO_PARENT_GIT: 'true',
+          EVOLVER_QUIET_PARENT_GIT: '1',
+          EVOLVER_SESSION_SOURCE: 'cursor',
+          AGENT_SESSIONS_DIR: path.join(home, '__no-openclaw__'),
+          EVOLVER_CURSOR_TRANSCRIPTS_DIR: '',
+        },
+        encoding: 'utf8',
+      });
+      if (res.status !== 0) {
+        throw new Error('child failed: ' + (res.stderr || res.stdout));
+      }
+      assert.match(res.stdout, /NO_GIT_CANARY/,
+        `own-workspace transcript was dropped because workspace has no .git:\n${res.stdout}`);
+    } finally { rmTmpHome(home); }
   });
 });

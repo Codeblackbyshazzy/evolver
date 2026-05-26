@@ -190,3 +190,69 @@ describe('validateCapsule', () => {
     assert.equal(validateCapsule(validCapsule()), true);
   });
 });
+
+describe('createCapsule — spec 1.8.0 §Appendix C user-authored fields', () => {
+  it('defaults visibility/scope/cost_tier/pack_of/author to null', () => {
+    const c = createCapsule({});
+    assert.equal(c.visibility, null);
+    assert.equal(c.scope, null);
+    assert.equal(c.cost_tier, null);
+    assert.equal(c.pack_of, null);
+    assert.equal(c.author, null);
+  });
+
+  it('preserves valid visibility values', () => {
+    for (const v of ['private', 'unlisted', 'public']) {
+      assert.equal(createCapsule({ visibility: v }).visibility, v);
+    }
+  });
+
+  it('coerces invalid visibility to null', () => {
+    assert.equal(createCapsule({ visibility: 'leaky' }).visibility, null);
+  });
+
+  it('preserves scope as a fresh array copy', () => {
+    const shared = ['rust', 'debug'];
+    const c1 = createCapsule({ scope: shared });
+    const c2 = createCapsule({ scope: shared });
+    c1.scope.push('extra');
+    assert.equal(c2.scope.length, 2, 'scope arrays must not share references');
+  });
+
+  it('coerces non-array scope to null', () => {
+    assert.equal(createCapsule({ scope: 'not-an-array' }).scope, null);
+  });
+
+  it('preserves valid cost_tier values', () => {
+    for (const t of ['cheap', 'standard', 'premium']) {
+      assert.equal(createCapsule({ cost_tier: t }).cost_tier, t);
+    }
+  });
+
+  it('coerces invalid cost_tier to null', () => {
+    assert.equal(createCapsule({ cost_tier: 'free' }).cost_tier, null);
+  });
+
+  it('preserves valid author object', () => {
+    const c = createCapsule({ author: { handle: 'evox', evox_install_id: 'evox_install_x' } });
+    assert.deepEqual(c.author, { handle: 'evox', evox_install_id: 'evox_install_x' });
+  });
+
+  it('drops author when handle is missing', () => {
+    assert.equal(createCapsule({ author: { evox_install_id: 'x' } }).author, null);
+  });
+
+  it('drops author when evox_install_id is missing', () => {
+    // Schema declares both fields required when author is present.
+    // A partial pair would be written half-formed and fail validation
+    // downstream — drop the field entirely.
+    assert.equal(createCapsule({ author: { handle: 'alice' } }).author, null);
+  });
+
+  it('strips extra keys from author object (additionalProperties:false guard)', () => {
+    const c = createCapsule({
+      author: { handle: 'evox', evox_install_id: 'x', extra: 'should-be-stripped' },
+    });
+    assert.deepEqual(c.author, { handle: 'evox', evox_install_id: 'x' });
+  });
+});

@@ -43,7 +43,7 @@ describe('Phase C slice 6 — EVOMAP_ROUTER_ENABLED gating + router_decision log
     });
 
     const body = {
-      model: 'claude-opus-4-7',
+      model: 'global.anthropic.claude-opus-4-7',
       messages: [{ role: 'user', content: 'what is npm?' }],
     };
     const res = await handler({
@@ -52,7 +52,7 @@ describe('Phase C slice 6 — EVOMAP_ROUTER_ENABLED gating + router_decision log
     });
     assert.equal(res.status, 200);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].body.model, 'claude-opus-4-7', 'model must not be rewritten when disabled');
+    assert.equal(calls[0].body.model, 'global.anthropic.claude-opus-4-7', 'model must not be rewritten when disabled');
     assert.equal(calls[0].body, body, 'body identity preserved on the off-path');
     assert.equal(logger.lines.length, 0, 'no log lines emitted when disabled');
   });
@@ -68,7 +68,7 @@ describe('Phase C slice 6 — EVOMAP_ROUTER_ENABLED gating + router_decision log
 
     await handler({
       body: {
-        model: 'claude-opus-4-7',
+        model: 'global.anthropic.claude-opus-4-7',
         messages: [{ role: 'user', content: 'what is npm?' }],
       },
       headers: { 'x-api-key': 'sk-test' },
@@ -82,8 +82,8 @@ describe('Phase C slice 6 — EVOMAP_ROUTER_ENABLED gating + router_decision log
     assert.equal(d.event, 'router_decision');
     assert.equal(d.tier, 'cheap');
     assert.equal(d.reason, 'trivial_lookup');
-    assert.equal(d.original_model, 'claude-opus-4-7');
-    assert.equal(d.chosen_model, 'claude-haiku-4-5');
+    assert.equal(d.original_model, 'global.anthropic.claude-opus-4-7');
+    assert.equal(d.chosen_model, 'global.anthropic.claude-haiku-4-5-20251001-v1:0');
     assert.equal(d.escalation_skipped, false);
     assert.equal(d.fallback, null);
   });
@@ -100,7 +100,7 @@ describe('Phase C slice 6 — EVOMAP_ROUTER_ENABLED gating + router_decision log
       routerEnabled: true,
     });
 
-    const body = { model: 'claude-opus-4-7' };
+    const body = { model: 'global.anthropic.claude-opus-4-7' };
     Object.defineProperty(body, 'messages', {
       get() { throw new Error('boom'); },
     });
@@ -118,7 +118,7 @@ describe('Phase C slice 6 — EVOMAP_ROUTER_ENABLED gating + router_decision log
     assert.equal(decisionLines.length, 1);
     assert.equal(decisionLines[0].fallback, 'classifier_error');
     assert.equal(decisionLines[0].tier, null, 'no tier when classifier failed');
-    assert.equal(decisionLines[0].chosen_model, 'claude-opus-4-7', 'falls back to original model');
+    assert.equal(decisionLines[0].chosen_model, 'global.anthropic.claude-opus-4-7', 'falls back to original model');
   });
 
   it('honors EVOMAP_ROUTER_ENABLED=1 from the environment when option omitted', async () => {
@@ -129,10 +129,10 @@ describe('Phase C slice 6 — EVOMAP_ROUTER_ENABLED gating + router_decision log
       const logger = makeLogger();
       const handler = buildMessagesHandler({ anthropicProxy: fn, logger });
       await handler({
-        body: { model: 'claude-opus-4-7', messages: [{ role: 'user', content: 'what is npm?' }] },
+        body: { model: 'global.anthropic.claude-opus-4-7', messages: [{ role: 'user', content: 'what is npm?' }] },
         headers: { 'x-api-key': 'sk-test' },
       });
-      assert.equal(calls[0].body.model, 'claude-haiku-4-5', 'env flag enables rewrite');
+      assert.equal(calls[0].body.model, 'global.anthropic.claude-haiku-4-5-20251001-v1:0', 'env flag enables rewrite');
       const decisionLines = logger.lines.filter((l) => l.stream === 'log');
       assert.equal(decisionLines.length, 1);
     } finally {
@@ -150,10 +150,10 @@ describe('Phase C slice 6 — EVOMAP_ROUTER_ENABLED gating + router_decision log
       const logger = makeLogger();
       const handler = buildMessagesHandler({ anthropicProxy: fn, logger });
       await handler({
-        body: { model: 'claude-opus-4-7', messages: [{ role: 'user', content: 'what is npm?' }] },
+        body: { model: 'global.anthropic.claude-opus-4-7', messages: [{ role: 'user', content: 'what is npm?' }] },
         headers: { 'x-api-key': 'sk-test' },
       });
-      assert.equal(calls[0].body.model, 'claude-opus-4-7',
+      assert.equal(calls[0].body.model, 'global.anthropic.claude-opus-4-7',
         `value ${JSON.stringify(val)} must not enable rewrite`);
       assert.equal(logger.lines.length, 0);
     }
