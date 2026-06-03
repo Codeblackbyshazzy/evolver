@@ -256,3 +256,55 @@ describe('memoryGraph - recordAttempt', () => {
     assert.strictEqual(state.last_action.outcome_recorded, false);
   });
 });
+
+describe('memoryGraph - recordExternalCandidate', () => {
+  let tmpDir, origEnv;
+  beforeEach(() => { ({ tmpDir, origEnv } = setupTmpEnv()); });
+  afterEach(() => { teardownTmpEnv(tmpDir, origEnv); });
+
+  it('returns null when asset is missing type or id', () => {
+    assert.strictEqual(mg.recordExternalCandidate({ asset: null }), null);
+    assert.strictEqual(mg.recordExternalCandidate({ asset: { id: 'x' } }), null);
+    assert.strictEqual(mg.recordExternalCandidate({ asset: { type: 'Capsule' } }), null);
+  });
+
+  // The candidate.{trigger,gene,confidence} hints are Capsule-only by design:
+  // a Gene candidate must NOT acquire synthetic trigger/gene/confidence even if
+  // the incoming asset carries those keys. This guards the a2a ingestion path
+  // against a refactor that drops the `type === 'Capsule'` condition.
+  it('populates trigger/gene/confidence for a Capsule', () => {
+    const ev = mg.recordExternalCandidate({
+      asset: { type: 'Capsule', id: 'cap1', trigger: ['log_error'], gene: 'gene_x', confidence: 0.8 },
+      source: 'peer_node',
+      signals: ['log_error'],
+    });
+    assert.strictEqual(ev.kind, 'external_candidate');
+    assert.deepStrictEqual(ev.candidate.trigger, ['log_error']);
+    assert.strictEqual(ev.candidate.gene, 'gene_x');
+    assert.strictEqual(ev.candidate.confidence, 0.8);
+    assert.strictEqual(ev.external.source, 'peer_node');
+    assert.deepStrictEqual(ev.asset, { type: 'Capsule', id: 'cap1' });
+  });
+
+  it('does NOT synthesize Capsule-only fields for a Gene candidate', () => {
+    const ev = mg.recordExternalCandidate({
+      // a Gene carrying these keys must still yield the empty/null defaults
+      asset: { type: 'Gene', id: 'gene1', trigger: ['x'], gene: 'g', confidence: 0.9 },
+      source: 'peer_node',
+      signals: [],
+    });
+    assert.strictEqual(ev.kind, 'external_candidate');
+    assert.deepStrictEqual(ev.candidate.trigger, []);
+    assert.strictEqual(ev.candidate.gene, null);
+    assert.strictEqual(ev.candidate.confidence, null);
+  });
+
+  it('defaults source to "external" and persists the event', () => {
+    const ev = mg.recordExternalCandidate({ asset: { type: 'Capsule', id: 'cap2' } });
+    assert.strictEqual(ev.external.source, 'external');
+    // confidence falls back to null when the Capsule omits it
+    assert.strictEqual(ev.candidate.confidence, null);
+    const events = mg.tryReadMemoryGraphEvents();
+    assert.ok(events.some(e => e.id === ev.id && e.kind === 'external_candidate'));
+  });
+});

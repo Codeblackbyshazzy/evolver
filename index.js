@@ -178,65 +178,6 @@ function isPendingSolidify(state) {
   return String(lastSolid.run_id) !== String(lastRun.run_id);
 }
 
-/**
- * Age (ms) of the currently-pending run, measured from last_run.created_at.
- * Returns null when there is no pending run or no parseable timestamp — callers
- * MUST treat null as "age unknown, do not force-reject" so a malformed/missing
- * timestamp never causes us to discard a run that a sub-agent is still working.
- * @param {object} state - parsed evolution_solidify_state.json
- * @param {number} now - epoch ms (injected for deterministic tests)
- * @returns {number|null}
- */
-function pendingRunAgeMs(state, now) {
-  if (!isPendingSolidify(state)) return null;
-  const lastRun = state && state.last_run ? state.last_run : null;
-  const stamp = lastRun && (lastRun.created_at || lastRun.started_at);
-  if (!stamp) return null;
-  const t = Date.parse(String(stamp));
-  if (!Number.isFinite(t)) return null;
-  const age = Number(now) - t;
-  return age >= 0 ? age : null;
-}
-
-/**
- * Issue #556: auto-reject a pending run that has been waiting longer than the
- * staleness TTL. In Bridge mode the sub-agent solidifies asynchronously, so a
- * pending run is normal *while the sub-agent is alive*. But if the sub-agent
- * produced no changes, crashed, or the daemon restarted onto a stale pending
- * state, last_solidify never catches up and the Ralph-loop gate sleeps forever.
- * Once the pending run is older than the sub-agent's own hard ceiling
- * (cycleTimeoutMs) it cannot still be running, so we clear it. This is distinct
- * from rejectPendingRun()'s bridge-disabled reason so the two paths stay
- * auditable in the state file.
- * @returns {boolean} true if a stale pending run was found and rejected
- */
-function rejectStalePendingRun(statePath) {
-  try {
-    const state = readJsonSafe(statePath);
-    // Re-check pending status under this fresh read (TOCTOU guard): if the
-    // sub-agent solidified between the gate's age snapshot and now, the run is
-    // no longer pending and we MUST NOT overwrite that successful solidify with
-    // a rejection. isPendingSolidify() is true only when last_run.run_id
-    // exists, so this also subsumes the run_id presence check.
-    if (state && isPendingSolidify(state)) {
-      state.last_solidify = {
-        run_id: state.last_run.run_id,
-        rejected: true,
-        reason: 'stale_pending_no_solidify_autoreject_no_rollback',
-        timestamp: new Date().toISOString(),
-      };
-      const tmp = `${statePath}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', 'utf8');
-      fs.renameSync(tmp, statePath);
-      return true;
-    }
-  } catch (e) {
-    console.warn('[Loop] Failed to clear stale pending run state: ' + (e.message || e));
-  }
-
-  return false;
-}
-
 function parseMs(v, fallback) {
   const n = parseInt(String(v == null ? '' : v), 10);
   if (Number.isFinite(n)) return Math.max(0, n);
@@ -1236,27 +1177,6 @@ async function main() {
         const cycleTimeoutMs = parseMs(process.env.EVOLVER_CYCLE_TIMEOUT_MS, 2700000); // 45 min default
         const progressUpdateMs = parseMs(process.env.EVOLVER_PROGRESS_UPDATE_MS, 60000); // 1 min default
 
-        // Issue #556: staleness TTL for a pending (un-solidified) run. In Bridge
-        // mode the gate below sleeps while a sub-agent solidifies asynchronously,
-        // which is correct *while the sub-agent is alive*. If the sub-agent made
-        // no changes / crashed / the daemon restarted onto a stale pending state,
-        // last_solidify never catches up and the gate would sleep forever. Once a
-        // pending run is older than the sub-agent's own hard ceiling it cannot
-        // still be running, so we auto-reject it and let the next cycle proceed.
-        //
-        // The default is the cycle hard-ceiling -- but ONLY when that ceiling is
-        // actually enforced. If EVOLVER_CYCLE_TIMEOUT_ENABLED=false (or the
-        // timeout is 0), a sub-agent may legitimately run longer than 45 min, so
-        // there is no safe default age at which a pending run is provably dead;
-        // we default the TTL to 0 (staleness auto-reject OFF) and let the user
-        // opt back in explicitly via EVOLVER_PENDING_STALE_MS. A value of 0
-        // disables the TTL check in the gate below.
-        const cycleCeilingMs = cycleTimeoutEnabled ? cycleTimeoutMs : 0;
-        const pendingStaleMs = parseMs(
-          process.env.EVOLVER_PENDING_STALE_MS,
-          cycleCeilingMs
-        );
-
         // Start hub heartbeat (keeps node alive independently of evolution cycles)
         try {
           if (process.env.EVOMAP_PROXY === '1' || process.env.A2A_TRANSPORT === 'mailbox') {
@@ -1412,6 +1332,7 @@ async function main() {
         // Hoist module refs used inside the loop to avoid repeated module lookups per cycle
         const idleScheduler = require('./src/gep/idleScheduler');
         const { shouldDistillFromFailures: shouldDF, autoDistillFromFailures: autoDF } = require('./src/gep/skillDistiller');
+        const { autoDistillLlm } = require('./src/gep/autoDistillLlm'); // P3: autonomous LLM distillation (shadow-first, off by default)
         const { tryExplore } = require('./src/gep/explore');
 
         let currentSleepMs = minSleepMs;
@@ -1424,30 +1345,8 @@ async function main() {
           // Ralph-loop gating: do not run a new cycle while previous run is pending solidify.
           const st0 = readJsonSafe(solidifyStatePath);
           if (isPendingSolidify(st0)) {
-            // Issue #556: a pending run that has outlived the sub-agent's hard
-            // ceiling can never be solidified by that sub-agent, so clear it
-            // instead of sleeping forever. This applies in Bridge mode too,
-            // where the bridge-disabled auto-reject below never runs. TTL-gated
-            // so a live sub-agent's in-flight pending state is left untouched.
-            const ageMs = pendingRunAgeMs(st0, Date.now());
-            const cleared =
-              pendingStaleMs > 0 && ageMs !== null && ageMs >= pendingStaleMs
-                ? rejectStalePendingRun(solidifyStatePath)
-                : false;
-            if (cleared) {
-              console.warn(
-                '[Loop] Auto-rejected stale pending run after ' +
-                  Math.round(ageMs / 1000) + 's with no solidify ' +
-                  '(sub-agent did not complete; state only, no rollback). Issue #556.'
-              );
-              // Run was cleared (no longer pending) -> fall through to a fresh cycle.
-            } else {
-              // Either not stale yet, or the reject did not take (write failed /
-              // solidify won the race). In every such case the run is still
-              // pending, so sleep instead of stacking a new cycle on top of it.
-              await sleepMs(Math.max(pendingSleepMs, minSleepMs));
-              continue;
-            }
+            await sleepMs(Math.max(pendingSleepMs, minSleepMs));
+            continue;
           }
 
           const t0 = Date.now();
@@ -1556,6 +1455,21 @@ async function main() {
                 } catch (e) {
                   if (isVerbose) console.warn('[OMLS] Distill error: ' + (e.message || e));
                 }
+                // P3: autonomous LLM-quality distillation of SUCCESS capsules.
+                // Default off; shadow logs a candidate; enforce upserts (after a
+                // real run-green gate). Reuses the P1 exec bridge under the hood.
+                if ((process.env.EVOLVER_AUTO_DISTILL_LLM || 'off') !== 'off') {
+                  try {
+                    const llmRes = await autoDistillLlm();
+                    if (llmRes && llmRes.ok && llmRes.gene) {
+                      console.log('[OMLS] Idle-window LLM distillation enforced gene: ' + llmRes.gene.id);
+                    } else if (llmRes && llmRes.reason === 'shadow_logged') {
+                      console.log('[OMLS] LLM distillation shadow candidate: ' + (llmRes.candidate && llmRes.candidate.id));
+                    }
+                  } catch (e) {
+                    if (isVerbose) console.warn('[OMLS] LLM distill error (non-fatal): ' + (e.message || e));
+                  }
+                }
               }
               if (schedule.should_explore) {
                 try {
@@ -1565,6 +1479,22 @@ async function main() {
                   }
                 } catch (e) {
                   if (isVerbose) console.warn('[OMLS] Explore error: ' + (e.message || e));
+                }
+              }
+              // P2: conversation capability -> distilled gene (shadow-only v1).
+              // Deliberately OUTSIDE the should_distill guard: should_distill is
+              // true only at aggressive/deep intensity, but headless/air-gapped
+              // hosts fall back to 'normal', which would make P2 a dead feature.
+              // A freshly-discovered capability is time-relevant; gate it solely on
+              // its own flag + the per-slug cooldown + a non-empty queue (all of
+              // which already bound spend). Default off => zero behavior change.
+              if ((process.env.EVOLVER_CONV_DISTILL_ENABLED || 'off') !== 'off') {
+                try {
+                  const { autoDistillConversation } = require('./src/gep/autoDistillConv');
+                  const convRes = await autoDistillConversation();
+                  if (convRes && convRes.ok) console.log('[P2] conv-distill ' + convRes.mode + ' candidate: ' + (convRes.gene_id || convRes.reason));
+                } catch (e) {
+                  if (isVerbose) console.warn('[P2] conv-distill error (non-fatal): ' + (e.message || e));
                 }
               }
               if (isVerbose && schedule.idle_seconds >= 0) {
@@ -1793,6 +1723,60 @@ async function main() {
       console.error('[SOLIDIFY] Error:', error);
       process.exit(2);
     }
+  } else if (command === 'exec') {
+    // node index.js exec --harness=claude-code [--once] [--max-cycles N]
+    // P1 auto-exec bridge: run the Brain, scrape its sessions_spawn(...), spawn
+    // the Hand (headless claude) to apply + solidify. Shadow-first opt-in.
+    if (String(process.env.EVOLVE_EXEC_BRIDGE || '').toLowerCase() !== 'true') {
+      console.error('[exec] EVOLVE_EXEC_BRIDGE is not "true". The auto-exec bridge is opt-in. Refusing.');
+      process.exit(2);
+    }
+    const getFlag = (n) => {
+      const i = args.findIndex(a => a === `--${n}` || a.startsWith(`--${n}=`));
+      if (i === -1) return undefined;
+      const h = args[i];
+      if (h.includes('=')) return h.split('=').slice(1).join('='); // --n=value
+      // bare --n: if the next token is a value (not another --flag), consume it
+      // (#179 r6: support `--max-cycles N` space-separated, not just =N). A
+      // trailing bare flag with no following value stays boolean true (e.g. --once).
+      const next = args[i + 1];
+      return (next !== undefined && !next.startsWith('--')) ? next : true;
+    };
+    const harness = String(getFlag('harness') || 'claude-code');
+    const once = getFlag('once') === true;
+    // #179 r7: validate --max-cycles. Number('foo')||0 silently became 0 =
+    // unbounded daemon — a typo must fail fast, not run forever. Absent flag =>
+    // 0 (intentional unbounded). A present value must be a non-negative integer.
+    const rawMaxCycles = getFlag('max-cycles');
+    let maxCycles = 0;
+    if (rawMaxCycles !== undefined && rawMaxCycles !== true) {
+      const n = Number(rawMaxCycles);
+      if (!Number.isInteger(n) || n < 0) {
+        console.error(`[exec] invalid --max-cycles '${rawMaxCycles}' (expected a non-negative integer; 0 or omit = unbounded)`);
+        process.exit(2);
+      }
+      maxCycles = n;
+    } else if (rawMaxCycles === true) {
+      console.error('[exec] --max-cycles requires a value (e.g. --max-cycles 5 or --max-cycles=5)');
+      process.exit(2);
+    }
+    if (!['claude-code', 'openclaw'].includes(harness)) {
+      console.error(`[exec] unknown --harness '${harness}' (expected claude-code | openclaw)`);
+      process.exit(2);
+    }
+    try {
+      const { runExecBridge } = require('./src/gep/execBridge');
+      const res = await runExecBridge({ harness, once, maxCycles });
+      console.log(`[exec] done: cycles=${res.cycles} lastOutcome=${res.lastOutcome}`);
+      // Exit 0 only on a genuine success. A bounded/daemon run that ended in
+      // hand_failed/brain_failed/no_spawn must report non-zero to shells & CI
+      // (Bugbot #179: do not exit 0 on failure just because cycles>0).
+      process.exit(res.lastOutcome === 'success' ? 0 : 1);
+    } catch (error) {
+      console.error('[exec] bridge error:', error && error.message ? error.message : error);
+      process.exit(1);
+    }
+
   } else if (command === 'distill') {
     const responseFileFlag = args.find(a => typeof a === 'string' && a.startsWith('--response-file='));
     if (!responseFileFlag) {
@@ -2861,9 +2845,7 @@ module.exports = {
   main,
   readJsonSafe,
   rejectPendingRun,
-  rejectStalePendingRun,
   isPendingSolidify,
-  pendingRunAgeMs,
   parseBoolEnv,
   CycleTimeoutError,
   writeCycleProgressAtomic,

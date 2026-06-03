@@ -108,6 +108,38 @@ describe('typed message builders', () => {
     assert.equal(msg.payload.asset_type, 'Capsule');
   });
 
+  // The three optional fields below are not cosmetic: their presence/absence
+  // drives Hub-side behavior (search_only / asset_ids select the free vs paid
+  // fetch path; signals scope the search). They must be OMITTED — not sent as
+  // empty/false — when the input is empty/falsy, so assert with the `in`
+  // operator on payload, not on values.
+  it('buildFetch omits optional fields when not provided', () => {
+    const msg = buildFetch({ assetType: 'Capsule', localId: 'c1' });
+    assert.equal('signals' in msg.payload, false);
+    assert.equal('search_only' in msg.payload, false);
+    assert.equal('asset_ids' in msg.payload, false);
+  });
+
+  it('buildFetch includes signals only when a non-empty array', () => {
+    assert.equal('signals' in buildFetch({ signals: [] }).payload, false);
+    assert.equal('signals' in buildFetch({ signals: null }).payload, false);
+    const msg = buildFetch({ signals: ['log_error', 'perf'] });
+    assert.deepEqual(msg.payload.signals, ['log_error', 'perf']);
+  });
+
+  it('buildFetch sets search_only only for an exact boolean true', () => {
+    assert.equal('search_only' in buildFetch({ searchOnly: false }).payload, false);
+    assert.equal('search_only' in buildFetch({ searchOnly: 'true' }).payload, false);
+    assert.equal(buildFetch({ searchOnly: true }).payload.search_only, true);
+  });
+
+  it('buildFetch includes asset_ids only when a non-empty array', () => {
+    assert.equal('asset_ids' in buildFetch({ assetIds: [] }).payload, false);
+    assert.equal('asset_ids' in buildFetch({ assetIds: null }).payload, false);
+    const msg = buildFetch({ assetIds: ['sha256:a', 'sha256:b'] });
+    assert.deepEqual(msg.payload.asset_ids, ['sha256:a', 'sha256:b']);
+  });
+
   it('buildReport creates a report message', () => {
     const msg = buildReport({ assetId: 'sha256:abc', validationReport: { ok: true } });
     assert.equal(msg.message_type, 'report');

@@ -3,13 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const {
-  rejectPendingRun,
-  rejectStalePendingRun,
-  isPendingSolidify,
-  pendingRunAgeMs,
-  readJsonSafe,
-} = require('../index.js');
+const { rejectPendingRun, isPendingSolidify, readJsonSafe } = require('../index.js');
 
 const savedEnv = {};
 const envKeys = [
@@ -93,91 +87,6 @@ describe('isPendingSolidify', () => {
       last_run: { run_id: 123 },
       last_solidify: { run_id: '123' },
     }), false);
-  });
-});
-
-describe('pendingRunAgeMs (issue #556)', () => {
-  const NOW = Date.parse('2026-06-03T12:00:00.000Z');
-
-  it('returns null when there is no pending run', () => {
-    assert.equal(pendingRunAgeMs(null, NOW), null);
-    assert.equal(pendingRunAgeMs({}, NOW), null);
-    assert.equal(pendingRunAgeMs({
-      last_run: { run_id: 'r1' },
-      last_solidify: { run_id: 'r1' },
-    }, NOW), null);
-  });
-
-  it('returns null when pending but no parseable timestamp (age unknown -> never force-reject)', () => {
-    assert.equal(pendingRunAgeMs({ last_run: { run_id: 'r1' } }, NOW), null);
-    assert.equal(pendingRunAgeMs({ last_run: { run_id: 'r1', created_at: 'not-a-date' } }, NOW), null);
-  });
-
-  it('computes age from created_at', () => {
-    const created = new Date(NOW - 90 * 1000).toISOString();
-    assert.equal(pendingRunAgeMs({ last_run: { run_id: 'r1', created_at: created } }, NOW), 90 * 1000);
-  });
-
-  it('falls back to started_at when created_at is absent', () => {
-    const started = new Date(NOW - 30 * 1000).toISOString();
-    assert.equal(pendingRunAgeMs({ last_run: { run_id: 'r1', started_at: started } }, NOW), 30 * 1000);
-  });
-
-  it('returns null for a future timestamp (clock skew -> do not force-reject)', () => {
-    const future = new Date(NOW + 60 * 1000).toISOString();
-    assert.equal(pendingRunAgeMs({ last_run: { run_id: 'r1', created_at: future } }, NOW), null);
-  });
-});
-
-describe('rejectStalePendingRun (issue #556)', () => {
-  it('marks a pending run rejected with the stale-specific reason, preserving untracked files', () => {
-    const stateDir = path.join(tmpDir, 'memory', 'evolution');
-    fs.mkdirSync(stateDir, { recursive: true });
-    const sp = path.join(stateDir, 'evolution_solidify_state.json');
-    fs.writeFileSync(sp, JSON.stringify({ last_run: { run_id: 'run_stale' } }, null, 2));
-    fs.writeFileSync(path.join(tmpDir, 'KEEP.md'), 'keep me\n');
-
-    const changed = rejectStalePendingRun(sp);
-    const state = JSON.parse(fs.readFileSync(sp, 'utf8'));
-
-    assert.equal(changed, true);
-    assert.equal(state.last_solidify.run_id, 'run_stale');
-    assert.equal(state.last_solidify.rejected, true);
-    // Distinct reason from rejectPendingRun() so the two paths stay auditable.
-    assert.equal(state.last_solidify.reason, 'stale_pending_no_solidify_autoreject_no_rollback');
-    assert.equal(fs.readFileSync(path.join(tmpDir, 'KEEP.md'), 'utf8'), 'keep me\n');
-    // After rejection the run is no longer pending.
-    assert.equal(isPendingSolidify(state), false);
-  });
-
-  it('returns false when there is no pending run to reject', () => {
-    const stateDir = path.join(tmpDir, 'memory', 'evolution');
-    fs.mkdirSync(stateDir, { recursive: true });
-    const sp = path.join(stateDir, 'evolution_solidify_state.json');
-    fs.writeFileSync(sp, JSON.stringify({}, null, 2));
-    assert.equal(rejectStalePendingRun(sp), false);
-  });
-
-  it('does NOT overwrite a run that already solidified (TOCTOU guard, Bugbot #559 High)', () => {
-    // If the sub-agent solidifies between the gate's age snapshot and this
-    // write, last_run == last_solidify (not pending) and a rejection would
-    // corrupt a successful solidify. rejectStalePendingRun must re-check
-    // pending status under its own fresh read and refuse.
-    const stateDir = path.join(tmpDir, 'memory', 'evolution');
-    fs.mkdirSync(stateDir, { recursive: true });
-    const sp = path.join(stateDir, 'evolution_solidify_state.json');
-    const solidified = {
-      last_run: { run_id: 'run_done' },
-      last_solidify: { run_id: 'run_done', validation: { ok: true } },
-    };
-    fs.writeFileSync(sp, JSON.stringify(solidified, null, 2));
-
-    const changed = rejectStalePendingRun(sp);
-    const after = JSON.parse(fs.readFileSync(sp, 'utf8'));
-
-    assert.equal(changed, false, 'must not reject an already-solidified run');
-    // The successful solidify is preserved verbatim — not overwritten with a rejection.
-    assert.deepEqual(after.last_solidify, solidified.last_solidify);
   });
 });
 
@@ -378,69 +287,6 @@ describe('loop-mode EVOLVE_BRIDGE default (issue #96)', () => {
     assert.ok(
       /git stash/.test(combined),
       'safety banner must reference git stash recovery: ' + combined.slice(0, 800)
-    );
-  });
-
-  // Issue #556: in bridge=true mode (the default) a pending run that never gets
-  // solidified used to wedge the Ralph-loop gate forever, because the
-  // bridge-disabled auto-reject only runs when EVOLVE_BRIDGE=false. We seed a
-  // stale pending state with an old timestamp and a short staleness TTL, then
-  // confirm the daemon clears it and proceeds rather than sleeping forever.
-  function seedStalePending(ageMs) {
-    const evoDir = path.join(tmpDir, 'memory', 'evolution');
-    fs.mkdirSync(evoDir, { recursive: true });
-    const createdAt = new Date(Date.now() - ageMs).toISOString();
-    fs.writeFileSync(
-      path.join(evoDir, 'evolution_solidify_state.json'),
-      JSON.stringify({ last_run: { run_id: 'run_stuck', created_at: createdAt } }, null, 2)
-    );
-  }
-
-  it('bridge=true: auto-rejects a stale pending run instead of Ralph-looping (#556)', () => {
-    ensureGitRepo(tmpDir);
-    // 10 min old pending run, TTL 1s -> immediately stale on the first gate check.
-    seedStalePending(10 * 60 * 1000);
-    const combined = runDaemonOnce({
-      EVOLVE_BRIDGE: 'true',
-      EVOLVER_PENDING_STALE_MS: '1000',
-    });
-    // The auto-reject log line is the deterministic proof of escape: it is
-    // emitted only when the gate clears the stale run and FALLS THROUGH to run
-    // a fresh cycle. Revert the fix and the gate sleeps pendingSleepMs forever
-    // -> the 30s-timeout daemon is killed and this line never appears. (What
-    // evolve.run() writes to the state file afterward is engine-dependent and
-    // not asserted here; rejectStalePendingRun's state mutation is covered by
-    // its own deterministic unit test above.)
-    assert.ok(
-      /Auto-rejected stale pending run/.test(combined) && /Issue #556/.test(combined),
-      'daemon must auto-reject the stale pending run in bridge mode (not Ralph-loop): ' + combined.slice(0, 800)
-    );
-  });
-
-  it('staleness TTL defaults OFF when the cycle timeout is disabled (Bugbot #559 Medium)', () => {
-    // When EVOLVER_CYCLE_TIMEOUT_ENABLED=false there is no enforced hard ceiling,
-    // so a sub-agent may legitimately run past 45 min. The TTL must NOT default
-    // to 45 min and reject an in-progress solidify. With no explicit
-    // EVOLVER_PENDING_STALE_MS, a stale-looking pending run must be left alone.
-    ensureGitRepo(tmpDir);
-    seedStalePending(60 * 60 * 1000); // 1h old — would trip a 45-min default TTL
-    const combined = runDaemonOnce({
-      EVOLVE_BRIDGE: 'true',
-      EVOLVER_CYCLE_TIMEOUT_ENABLED: 'false',
-      // EVOLVER_PENDING_STALE_MS intentionally unset -> default should be 0 (OFF).
-    });
-    assert.ok(
-      !/Auto-rejected stale pending run/.test(combined),
-      'TTL must be OFF by default when cycle timeout is disabled; must not auto-reject: ' + combined.slice(0, 800)
-    );
-    // The pending run is untouched (still no last_solidify written by us).
-    const sp = path.join(tmpDir, 'memory', 'evolution', 'evolution_solidify_state.json');
-    const state = JSON.parse(fs.readFileSync(sp, 'utf8'));
-    assert.equal(state.last_run && state.last_run.run_id, 'run_stuck');
-    assert.equal(
-      state.last_solidify && state.last_solidify.reason,
-      undefined,
-      'no stale-reject should have been written'
     );
   });
 });

@@ -174,12 +174,31 @@ class EvoMapProxy {
 
   async stop() {
     if (!this._started) return;
-    this.sync?.stop();
-    this.lifecycle?.stopHeartbeatLoop();
-    await this.server?.stop();
-    this.store?.close();
+    // Tear down in deliberate reverse-of-start order, but don't let one
+    // failing step abort the rest: a thrown sync.stop() must not leave the
+    // HTTP server and store leaked. Each step is isolated; failures are
+    // warned and collected so shutdown always completes.
+    const steps = [
+      ['sync', () => this.sync?.stop()],
+      ['heartbeat', () => this.lifecycle?.stopHeartbeatLoop()],
+      ['server', () => this.server?.stop()],
+      ['store', () => this.store?.close()],
+    ];
+    const errors = [];
+    for (const [name, fn] of steps) {
+      try {
+        await fn();
+      } catch (err) {
+        errors.push(err);
+        this.logger.warn('[proxy] error stopping ' + name + ': ' + (err && err.message ? err.message : err));
+      }
+    }
     this._started = false;
-    this.logger.log('[proxy] stopped');
+    if (errors.length) {
+      this.logger.log('[proxy] stopped with ' + errors.length + ' teardown error(s)');
+    } else {
+      this.logger.log('[proxy] stopped');
+    }
   }
 
   get mailbox() {

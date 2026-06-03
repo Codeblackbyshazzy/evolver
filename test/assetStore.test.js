@@ -579,3 +579,52 @@ describe('readRecentFailedCapsules', () => {
     assert.equal(result[0].id, 'fc7');
   });
 });
+
+describe('appendFailedCapsule', () => {
+  beforeEach(setupTempEnv);
+  afterEach(teardownTempEnv);
+
+  it('appends a capsule to the failed_capsules store', () => {
+    const { appendFailedCapsule, readRecentFailedCapsules } = freshRequire();
+    appendFailedCapsule({ type: 'Capsule', id: 'fc1', outcome: { status: 'failed' } });
+    const result = readRecentFailedCapsules(10);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'fc1');
+  });
+
+  it('ignores non-object input', () => {
+    const { appendFailedCapsule, readRecentFailedCapsules } = freshRequire();
+    appendFailedCapsule(null);
+    appendFailedCapsule('nope');
+    assert.deepEqual(readRecentFailedCapsules(10), []);
+  });
+
+  // The store is a bounded FIFO: it grows to FAILED_CAPSULES_MAX (200) then
+  // trims to FAILED_CAPSULES_TRIM_TO (100) in one batch — a deliberate sawtooth,
+  // NOT a hard 100-element cap. This pins the exact post-trim window so a future
+  // "simplify to a hard cap" or off-by-one refactor can't silently change how
+  // much failure history a production node retains.
+  it('trims in a 200->100 sawtooth, not a hard cap', () => {
+    const { appendFailedCapsule, readRecentFailedCapsules } = freshRequire();
+    for (let i = 1; i <= 250; i++) {
+      appendFailedCapsule({ type: 'Capsule', id: 'fc' + i, outcome: { status: 'failed' } });
+    }
+    const result = readRecentFailedCapsules(1000);
+    // After 250 appends: the 200th append makes length 201 -> trim to last 100
+    // (fc101..fc200); appends 201..250 push to 150 without re-trimming (never
+    // re-crosses 200), leaving fc102..fc250 — see derivation in the source.
+    assert.equal(result.length, 149);
+    assert.equal(result[0].id, 'fc102');
+    assert.equal(result[result.length - 1].id, 'fc250');
+  });
+
+  it('does not trim at exactly the max boundary', () => {
+    const { appendFailedCapsule, readRecentFailedCapsules } = freshRequire();
+    for (let i = 1; i <= 200; i++) {
+      appendFailedCapsule({ type: 'Capsule', id: 'fc' + i, outcome: { status: 'failed' } });
+    }
+    const result = readRecentFailedCapsules(1000);
+    assert.equal(result.length, 200);
+    assert.equal(result[0].id, 'fc1');
+  });
+});
