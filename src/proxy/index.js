@@ -33,6 +33,35 @@ function buildAssetSearchQuery(body = {}) {
   return query;
 }
 
+// Free-text path: `GET /a2a/assets/semantic-search?q=...` is the hub's vector
+// similarity search. Unlike signal-search it takes ONE natural-language query
+// string (the hub sanitizes it to <=200 chars) rather than a signal-keyword
+// list, so a caller can ask "what asset fits my current situation?" in prose.
+// The situation text rides in `q`; type / limit / fields forward the same way.
+function buildSemanticSearchQuery(body = {}) {
+  const query = { q: body.query };
+  const csv = (v) => (Array.isArray(v) ? v.join(',') : v);
+  if (body.fields != null) query.fields = csv(body.fields);
+  if (body.type != null) query.type = body.type;
+  if (body.limit != null) query.limit = body.limit;
+  return query;
+}
+
+// Pick the hub endpoint for the proxy's `POST /asset/search` contract. A
+// non-empty free-text `query` selects semantic-search (natural-language context
+// match); anything else keeps the signal-keyword path byte-for-byte, so every
+// existing signals-only caller is unaffected.
+function planAssetSearch(body = {}) {
+  const q = typeof body.query === 'string' ? body.query.trim() : '';
+  if (q) {
+    return {
+      path: '/a2a/assets/semantic-search',
+      query: buildSemanticSearchQuery({ ...body, query: q }),
+    };
+  }
+  return { path: '/a2a/assets/search', query: buildAssetSearchQuery(body) };
+}
+
 class EvoMapProxy {
   constructor(opts = {}) {
     this.hubUrl = (opts.hubUrl || process.env.A2A_HUB_URL || '').replace(/\/+$/, '');
@@ -116,11 +145,12 @@ class EvoMapProxy {
 
     const proxyHandlers = {
       assetFetch: (body) => this._proxyHttp('/a2a/fetch', body),
-      // GET (not POST): hub route is `GET /a2a/assets/search?signals=...`.
-      assetSearch: (body) => this._proxyHttp('/a2a/assets/search', null, {
-        method: 'GET',
-        query: buildAssetSearchQuery(body),
-      }),
+      // GET (not POST). planAssetSearch() picks signal-search vs semantic-search
+      // by whether the body carries a free-text `query` or a `signals` list.
+      assetSearch: (body) => {
+        const plan = planAssetSearch(body);
+        return this._proxyHttp(plan.path, null, { method: 'GET', query: plan.query });
+      },
       assetValidate: (body) => this._proxyHttp('/a2a/validate', body),
       // ATP passthrough (#460 Bug 2): merchant/consumer flows that used to call
       // hub directly via src/atp/hubClient.js must route through the proxy when
@@ -628,4 +658,4 @@ async function startProxy(opts = {}) {
   return { proxy, ...info };
 }
 
-module.exports = { EvoMapProxy, startProxy };
+module.exports = { EvoMapProxy, startProxy, buildAssetSearchQuery, buildSemanticSearchQuery, planAssetSearch };

@@ -51,10 +51,20 @@ describe('hubVerify', function () {
   });
 
   it('consumeOfflinePermit returns error with offline flag when no token cached', function () {
-    const { consumeOfflinePermit } = require('../src/gep/hubVerify');
-    const result = consumeOfflinePermit();
-    assert.strictEqual(result.ok, false);
-    assert.strictEqual(result.offline, true);
+    // Hermetic: a host that runs the evolver daemon exports A2A_* hub creds,
+    // which would flip this case "online" and fail the assertion. Clear them so
+    // the test exercises the genuine no-hub/offline path regardless of ambient
+    // env (the inherited-env trap).
+    const saved = {};
+    for (const k of ['A2A_HUB_URL', 'A2A_NODE_ID', 'A2A_NODE_SECRET']) { saved[k] = process.env[k]; delete process.env[k]; }
+    try {
+      const { consumeOfflinePermit } = require('../src/gep/hubVerify');
+      const result = consumeOfflinePermit();
+      assert.strictEqual(result.ok, false);
+      assert.strictEqual(result.offline, true);
+    } finally {
+      for (const k of Object.keys(saved)) { if (saved[k] !== undefined) process.env[k] = saved[k]; }
+    }
   });
 
   it('isSolidifyVerifyEnabled ignores env var disable in non-test env', function () {

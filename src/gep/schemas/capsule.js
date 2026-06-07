@@ -29,6 +29,11 @@ const CAPSULE_DEFAULTS = {
   env_fingerprint: null,
   source_type: null,
   reused_asset_id: null,
+  // Real measured token cost of deriving this capsule (input+output), captured
+  // from the proxy trace meter at solidify time. null when the proxy was
+  // inactive or usage was unobserved (consumers fall back to an estimate).
+  // Shape: { input_tokens, output_tokens, total_tokens, basis:'measured' }.
+  derivation_tokens: null,
   a2a: { eligible_to_broadcast: false },
   content: null,
   diff: null,
@@ -77,6 +82,27 @@ function createCapsule(partial) {
     c.a2a = { eligible_to_broadcast: false };
   } else {
     c.a2a = Object.assign({ eligible_to_broadcast: false }, c.a2a);
+  }
+
+  // Normalize derivation_tokens (optional measured-cost object). Coerce a
+  // malformed value to null so it never trips downstream schema validation.
+  if (c.derivation_tokens != null) {
+    const d = c.derivation_tokens;
+    if (typeof d !== 'object' || Array.isArray(d)) {
+      c.derivation_tokens = null;
+    } else {
+      const inp = Number(d.input_tokens);
+      const out = Number(d.output_tokens);
+      const tot = Number(d.total_tokens);
+      const safeInp = Number.isFinite(inp) && inp >= 0 ? inp : 0;
+      const safeOut = Number.isFinite(out) && out >= 0 ? out : 0;
+      c.derivation_tokens = {
+        input_tokens: safeInp,
+        output_tokens: safeOut,
+        total_tokens: Number.isFinite(tot) && tot >= 0 ? tot : safeInp + safeOut,
+        basis: typeof d.basis === 'string' ? d.basis : 'measured',
+      };
+    }
   }
 
   // Normalize string fields

@@ -946,6 +946,26 @@ describe('Codex / Claude session-log auto-discovery (#543)', () => {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   }
 
+  // resolveTranscriptDirs on win32 adds %APPDATA%\Claude\projects,
+  // %APPDATA%\claude-code\projects, and %APPDATA%\Cursor\User\workspaceStorage
+  // to the candidate list. The function reads process.env.APPDATA directly
+  // (not the passed homedir), so on a Windows host with Cursor or Claude
+  // actually installed those real paths leak into the result and break the
+  // "auto-discovers ~/.codex/sessions when no env override is set" /
+  // "returns empty when no platform dirs exist" assertions. Pin APPDATA to a
+  // path inside the fixture home so the Windows candidates all resolve to
+  // non-existent paths and get filtered out by fs.existsSync. POSIX hosts
+  // are unaffected (resolveTranscriptDirs does not run the win32 branch).
+  function withFixtureAppdata(home, fn) {
+    const saved = process.env.APPDATA;
+    process.env.APPDATA = path.join(home, 'AppData', 'Roaming');
+    try { return fn(); }
+    finally {
+      if (saved === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = saved;
+    }
+  }
+
   // Spawn a child node process with a pinned HOME so `os.homedir()`
   // resolves to the fixture. The reader's module-level constants
   // (`CURSOR_TRANSCRIPTS_DIR` from env, `AGENT_SESSIONS_DIR` from
@@ -992,10 +1012,12 @@ describe('Codex / Claude session-log auto-discovery (#543)', () => {
     const home = mkTmpHome();
     try {
       fs.mkdirSync(path.join(home, '.codex', 'sessions'), { recursive: true });
-      const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
-      assert.equal(dirs.length, 1, `expected 1 dir, got ${JSON.stringify(dirs)}`);
-      assert.ok(dirs[0].endsWith(path.join('.codex', 'sessions')),
-        `expected ~/.codex/sessions, got ${dirs[0]}`);
+      withFixtureAppdata(home, () => {
+        const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
+        assert.equal(dirs.length, 1, `expected 1 dir, got ${JSON.stringify(dirs)}`);
+        assert.ok(dirs[0].endsWith(path.join('.codex', 'sessions')),
+          `expected ~/.codex/sessions, got ${dirs[0]}`);
+      });
     } finally { rmTmpHome(home); }
   });
 
@@ -1005,10 +1027,12 @@ describe('Codex / Claude session-log auto-discovery (#543)', () => {
     try {
       fs.mkdirSync(path.join(home, '.codex', 'sessions'), { recursive: true });
       fs.mkdirSync(path.join(home, '.claude', 'projects'), { recursive: true });
-      const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
-      assert.equal(dirs.length, 2);
-      assert.ok(dirs.some(d => d.includes('.codex')));
-      assert.ok(dirs.some(d => d.includes('.claude')));
+      withFixtureAppdata(home, () => {
+        const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
+        assert.equal(dirs.length, 2);
+        assert.ok(dirs.some(d => d.includes('.codex')));
+        assert.ok(dirs.some(d => d.includes('.claude')));
+      });
     } finally { rmTmpHome(home); }
   });
 
@@ -1019,6 +1043,9 @@ describe('Codex / Claude session-log auto-discovery (#543)', () => {
       fs.mkdirSync(path.join(home, '.codex', 'sessions'), { recursive: true });
       const override = path.join(home, 'custom-transcripts');
       fs.mkdirSync(override, { recursive: true });
+      // No withFixtureAppdata wrapper here: the override path is the only
+      // expected return regardless of platform, and the override branch
+      // short-circuits before the win32 candidates are even built.
       const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: override });
       assert.deepEqual(dirs, [override],
         'explicit override must short-circuit default discovery');
@@ -1029,8 +1056,10 @@ describe('Codex / Claude session-log auto-discovery (#543)', () => {
     const { resolveTranscriptDirs } = require('../src/evolve/utils');
     const home = mkTmpHome();
     try {
-      const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
-      assert.deepEqual(dirs, []);
+      withFixtureAppdata(home, () => {
+        const dirs = resolveTranscriptDirs({ homedir: home, cursorTranscriptsDirOverride: '' });
+        assert.deepEqual(dirs, []);
+      });
     } finally { rmTmpHome(home); }
   });
 

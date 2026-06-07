@@ -314,13 +314,22 @@ describe('_buildInstallSearchPaths — Volta (fixed per-package path, not a vers
     });
   });
 
-  it('honors $VOLTA_HOME override (defaults to ~/.volta when unset)', () => {
+  it('honors $VOLTA_HOME override (defaults to ~/.volta on POSIX, %LOCALAPPDATA%\\Volta on Windows)', () => {
+    // Mirror the platform branching in _runtimePaths.js: Volta on Windows
+    // installs to %LOCALAPPDATA%\Volta (the default that `volta install`
+    // chooses), not %USERPROFILE%\.volta. The production code already
+    // handles both; this assertion has to as well, or it fires on every
+    // Windows CI run with no actual Volta install present.
     withEnv('VOLTA_HOME', undefined, () => {
       const paths = runtimePaths.__internals.buildInstallSearchPaths();
+      const voltaHome = process.platform === 'win32'
+        ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Volta')
+        : path.join(os.homedir(), '.volta');
       const expected = path.join(
-        os.homedir(), '.volta', 'tools', 'image', 'packages', '@evomap', 'evolver', 'lib', 'node_modules');
-      assert.ok(paths.includes(expected), 'default Volta home must be ~/.volta — got ' +
-        JSON.stringify(paths.filter((p) => p.includes('volta'))));
+        voltaHome, 'tools', 'image', 'packages', '@evomap', 'evolver', 'lib', 'node_modules');
+      assert.ok(paths.includes(expected),
+        'default Volta home: %LOCALAPPDATA%\\Volta on Windows, ~/.volta on POSIX. Got ' +
+        JSON.stringify(paths.filter((p) => p.toLowerCase().includes('volta'))));
     });
   });
 });
@@ -393,7 +402,15 @@ describe('_buildInstallSearchPaths → require.resolve (genuine allowlist integr
   // (findEvolverRoot itself can't reach this branch in-process because its
   // earlier repoRoot `../../..` check always wins inside the evolver repo.)
   it('an entry from buildInstallSearchPaths() resolves a planted @evomap/evolver', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-allowlist-'));
+    // Canonicalize the tmp root via realpathSync. macOS os.tmpdir() returns
+    // /var/folders/... which is a symlink to /private/var/folders/..., and
+    // require.resolve follows that symlink, so the returned absolute path
+    // would not byte-equal a path.join built from the un-canonicalized
+    // mkdtempSync return. Doing realpath once up front keeps both sides on
+    // the same canonical form on every platform (Linux/Windows realpath is
+    // a no-op when no symlinks are in play).
+    const tmpRaw = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-allowlist-'));
+    const tmp = fs.realpathSync(tmpRaw);
     const orig = process.env.VOLTA_HOME;
     try {
       process.env.VOLTA_HOME = tmp; // makes the Volta node_modules dir appear in the list

@@ -262,4 +262,73 @@ describe('dispatch', () => {
     assert.ok(loggedLines.some(l => l.includes('[THOUGHT_PROCESS]')), 'thought process block should be emitted');
     assert.ok(loggedLines.some(l => l.includes('force_innovation:')), 'force_innovation field should appear');
   });
+
+  function reuseMocks(logged) {
+    mockMods['assetStore'] = { getLastEventId: () => null };
+    mockMods['prompt'] = { buildGepPrompt: () => 'P', buildReusePrompt: () => 'REUSE_PROMPT', buildHubMatchedBlock: () => null };
+    mockMods['assetCallLog'] = { logAssetCall: (e) => logged.push(e), assetCostIndex: () => ({}) };
+    mockMods['solidify'] = { readStateForSolidify: () => ({}), writeStateForSolidify: () => {} };
+    mockMods['bridge'] = { clip: s => s, writePromptArtifact: () => ({}), renderSessionsSpawnCall: () => '' };
+    mockMods['paths'] = { getEvolutionDir: () => '/tmp/evo', getRepoRoot: () => '/tmp/repo' };
+    mockMods['explore'] = { tryExplore: async () => ({ signals: [] }) };
+    delete require.cache[require.resolve('../src/evolve/pipeline/dispatch')];
+    return require('../src/evolve/pipeline/dispatch').dispatch;
+  }
+
+  it('logs MEASURED tokens_saved from the reused asset derivation_tokens', async () => {
+    const logged = [];
+    const dispatch = reuseMocks(logged);
+    const origLog = console.log; console.log = () => {};
+    try {
+      await dispatch(buildCtx({
+        bridgeEnabled: false,
+        hubHit: {
+          hit: true, mode: 'direct', asset_id: 'asset1', score: 0.9,
+          match: { id: 'asset1', derivation_tokens: { total_tokens: 123456, basis: 'measured' } },
+        },
+      }));
+    } finally { console.log = origLog; }
+    const reuse = logged.find(e => e.action === 'asset_reuse');
+    assert.ok(reuse, 'asset_reuse should be logged');
+    assert.equal(reuse.tokens_saved, 123456);
+    assert.equal(reuse.tokens_saved_basis, 'measured');
+  });
+
+  it('falls back to an ESTIMATED tokens_saved when the asset has no measured cost', async () => {
+    const logged = [];
+    const dispatch = reuseMocks(logged);
+    const origLog = console.log; console.log = () => {};
+    try {
+      await dispatch(buildCtx({
+        bridgeEnabled: false,
+        hubHit: {
+          hit: true, mode: 'direct', asset_id: 'asset2', score: 0.8,
+          match: { id: 'asset2', blast_radius: { lines: 50 } },
+        },
+      }));
+    } finally { console.log = origLog; }
+    const reuse = logged.find(e => e.action === 'asset_reuse');
+    assert.ok(reuse);
+    assert.equal(reuse.tokens_saved_basis, 'estimated_blast_radius');
+    assert.equal(reuse.tokens_saved, 160000); // 120000 + 50*800
+  });
+
+  it('discounts MEASURED tokens_saved for a reference reuse (Bugbot: was crediting the full cost)', async () => {
+    const logged = [];
+    const dispatch = reuseMocks(logged);
+    const origLog = console.log; console.log = () => {};
+    try {
+      await dispatch(buildCtx({
+        bridgeEnabled: false,
+        hubHit: {
+          hit: true, mode: 'reference', asset_id: 'asset3', score: 0.7,
+          match: { id: 'asset3', derivation_tokens: { total_tokens: 123456, basis: 'measured' } },
+        },
+      }));
+    } finally { console.log = origLog; }
+    const ref = logged.find(e => e.action === 'asset_reference');
+    assert.ok(ref, 'asset_reference should be logged');
+    assert.equal(ref.tokens_saved_basis, 'measured');
+    assert.equal(ref.tokens_saved, Math.round(123456 * 0.4)); // 49382, not the full 123456
+  });
 });

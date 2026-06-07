@@ -170,6 +170,32 @@ describe('P4-a Slice A — reuse attribution', () => {
       const acl = fresh('../src/gep/assetCallLog');
       const s = acl.reuseAttributionSummary();
       assert.equal(s.total_reuse, 0); assert.equal(s.total_reference, 0); assert.deepEqual(s.by_asset, []);
+      assert.equal(s.total_tokens_saved, 0);
+    });
+    it('sums tokens_saved across reuse/reference rows (total + per-asset)', () => {
+      const acl = fresh('../src/gep/assetCallLog');
+      acl.logAssetCall({ run_id: 'r1', action: 'asset_reuse', asset_id: 'A', tokens_saved: 1000 });
+      acl.logAssetCall({ run_id: 'r2', action: 'asset_reuse', asset_id: 'A', tokens_saved: 500 });
+      acl.logAssetCall({ run_id: 'r3', action: 'asset_reference', asset_id: 'B', tokens_saved: 200 });
+      acl.logAssetCall({ run_id: 'r4', action: 'asset_publish', asset_id: 'A', tokens_spent: 9999 }); // not a reuse
+      const s = acl.reuseAttributionSummary();
+      assert.equal(s.total_tokens_saved, 1700);
+      assert.equal(s.by_asset.find(x => x.asset_id === 'A').tokens_saved, 1500);
+      assert.equal(s.by_asset.find(x => x.asset_id === 'B').tokens_saved, 200);
+    });
+  });
+
+  describe('assetCostIndex (asset_id -> measured tokens_spent)', () => {
+    it('maps published assets to their derivation cost; latest wins, untokened skipped', () => {
+      const acl = fresh('../src/gep/assetCallLog');
+      acl.logAssetCall({ run_id: 'r1', action: 'asset_publish', asset_id: 'A', tokens_spent: 1000 });
+      acl.logAssetCall({ run_id: 'r2', action: 'asset_publish', asset_id: 'A', tokens_spent: 1200 });
+      acl.logAssetCall({ run_id: 'r3', action: 'asset_publish', asset_id: 'B' }); // no tokens -> skipped
+      acl.logAssetCall({ run_id: 'r4', action: 'asset_reuse', asset_id: 'C', tokens_saved: 5 }); // not a publish
+      const idx = acl.assetCostIndex();
+      assert.equal(idx['A'], 1200);
+      assert.ok(!('B' in idx));
+      assert.ok(!('C' in idx));
     });
   });
 });

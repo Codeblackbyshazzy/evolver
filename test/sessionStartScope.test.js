@@ -55,6 +55,19 @@ function baseEnv(extra) {
   };
 }
 
+// Make a temp dir that is a real, self-owned git work tree, and return a
+// CLAUDE_PROJECT_DIR pointing at it. Without this, the hook resolves a non-git
+// (or dubious-ownership) project dir and prepends a one-time "not a git
+// repository" notice — which breaks assertions that expect exact output. A
+// freshly `git init`-ed temp dir is owned by the test process, so it passes
+// `git rev-parse --is-inside-work-tree` even when the subprocess HOME lacks a
+// safe.directory exception for the checkout.
+function makeGitWorkspace() {
+  const dir = makeTmpDir();
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  return dir;
+}
+
 describe('evolver-session-start workspace scoping', () => {
   it('injects only the current workspace\'s outcomes, not other projects\'', () => {
     const home = makeTmpDir();
@@ -105,11 +118,14 @@ describe('evolver-session-start workspace scoping', () => {
   });
 
   it('emits nothing when only other workspaces have outcomes', () => {
-    const home = makeTmpDir();
+    // Use a real git workspace so the (incidental) non-git notice can't fire and
+    // mask the actual assertion: only other-workspace outcomes exist, so the
+    // hook must emit exactly nothing.
+    const home = makeGitWorkspace();
     try {
       const graph = path.join(home, '.evolver', 'memory', 'evolution', 'memory_graph.jsonl');
       writeGraph(graph, [outcome('other', { workspace_id: 'ws-other' })]);
-      const env = baseEnv({ HOME: home, MEMORY_GRAPH_PATH: graph, EVOLVER_WORKSPACE_ID: 'ws-mine' });
+      const env = baseEnv({ HOME: home, MEMORY_GRAPH_PATH: graph, EVOLVER_WORKSPACE_ID: 'ws-mine', CLAUDE_PROJECT_DIR: home });
       const result = runStart(env);
       assert.deepEqual(result, {}, `expected empty (no own outcomes), got ${JSON.stringify(result)}`);
     } finally { cleanup(home); }

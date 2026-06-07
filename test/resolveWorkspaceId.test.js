@@ -27,6 +27,24 @@ function makeTmpDir() {
 }
 function cleanup(dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
 
+// fs.symlinkSync on Windows requires either administrator privileges or
+// Developer Mode enabled. GitHub Actions windows-latest runners ship with
+// neither, so a probe-once-at-load gate lets the symlink tests cleanly skip
+// instead of failing with EPERM. POSIX hosts always pass the probe.
+const SYMLINKS_SUPPORTED = (() => {
+  let probe = null;
+  try {
+    probe = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-wsid-symlink-probe-'));
+    fs.symlinkSync(probe, path.join(probe, 'self-link'));
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    if (probe) { try { fs.rmSync(probe, { recursive: true, force: true }); } catch (_) {} }
+  }
+})();
+const symlinkIt = SYMLINKS_SUPPORTED ? it : it.skip;
+
 describe('resolveWorkspaceId FS-only fallback', () => {
   let saved;
   beforeEach(() => {
@@ -57,7 +75,14 @@ describe('resolveWorkspaceId FS-only fallback', () => {
       assert.match(id1, /^[a-f0-9]{32,}$/i, `id must be hex, got ${id1}`);
       const file = path.join(proj, '.evolver', 'workspace-id');
       assert.ok(fs.existsSync(file), 'secret file must be created');
-      assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'secret file must be 0600');
+      // POSIX-only: Windows does not enforce u/g/o permission bits the way
+      // chmod does, so fs.statSync().mode does not round-trip 0o600 on win32.
+      // The write site still calls writeFileSync with { mode: 0o600 }, which
+      // is the most we can do on a platform that does not implement POSIX
+      // permissions. Skip the assertion rather than mis-fail on Windows.
+      if (process.platform !== 'win32') {
+        assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'secret file must be 0600');
+      }
       // Second call re-reads the same id (lazy create is stable).
       assert.equal(resolveWorkspaceId(NO_PKG, proj), id1, 'id must be stable across calls');
     } finally { cleanup(proj); }
@@ -112,7 +137,7 @@ describe('resolveWorkspaceId FS-only fallback', () => {
     } finally { cleanup(repo); }
   });
 
-  it('refuses a pre-existing symlinked id FILE rather than following it', () => {
+  symlinkIt('refuses a pre-existing symlinked id FILE rather than following it', () => {
     const proj = makeTmpDir(); const evil = makeTmpDir();
     try {
       const evoDir = path.join(proj, '.evolver');
@@ -125,7 +150,7 @@ describe('resolveWorkspaceId FS-only fallback', () => {
     } finally { cleanup(proj); cleanup(evil); }
   });
 
-  it('refuses a symlinked .evolver dir (returns null, no write through link)', () => {
+  symlinkIt('refuses a symlinked .evolver dir (returns null, no write through link)', () => {
     const proj = makeTmpDir(); const evil = makeTmpDir();
     try {
       fs.symlinkSync(evil, path.join(proj, '.evolver'));
