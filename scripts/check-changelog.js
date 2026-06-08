@@ -19,7 +19,7 @@
  *   - Tag lookup is local-only (`git rev-parse`); CI must `git fetch
  *     --tags` first if it runs on a shallow clone.
  *   - `repoRoot` is injectable so tests don't need to monkey-patch the
- *     module by re-evaluating source (autogame-17 PR #115 review).
+ *     module by re-evaluating source (see PR #115 review).
  *
  * Usage:
  *   node scripts/check-changelog.js              # CLI mode, exits 0/1

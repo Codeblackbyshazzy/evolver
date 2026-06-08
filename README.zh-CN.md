@@ -178,7 +178,7 @@ evolver --loop
 | 循环模式 (`evolver --loop`) | 在守护进程循环中重复上述流程，带自适应休眠 |
 | 在 OpenClaw 中 | 宿主运行时解释 stdout 中的指令（如 `sessions_spawn(...)`） |
 
-> **`--loop` 不是"实时辅助正在干活的 agent"的模式。** 循环模式用于后台自维护任务（validator 验证、worker 任务、ATP 商家自动交付、solidify），它的 stdout 是被 evolver 自己消费的，**不会**传给正在运行的 OpenClaw / Cursor / Claude Code agent——即使这些宿主已经安装，`sessions_spawn(...)` 指令在循环模式下也不会被它们接收。如果你想让 evolver 观察并辅助一次具体的 agent 会话，请在那个 agent 会话内部调用 `evolver run`（一次一轮），OpenClaw 会在这次运行中接管 stdout 指令。对 OpenClaw 用户还要特别注意：`AGENT_NAME`（或 `AGENT_SESSIONS_DIR`）必须指向真正在产生 session 的那个 agent 目录（`~/.openclaw/agents/<名字>/sessions/`），否则 evolver 会回退到读自己的日志，看上去就像在"空转"。
+> **`--loop` 不是"实时辅助正在干活的 agent"的模式。** 循环模式用于后台自维护任务（validator 验证、worker 任务、ATP 商家自动交付、solidify），它的 stdout 是被 evolver 自己消费的，**不会**传给正在运行的 OpenClaw / Cursor / Claude Code agent——即使这些宿主已经安装，`sessions_spawn(...)` 指令在循环模式下也不会被它们接收。如果你想让 evolver 观察并辅助一次具体的 agent 会话，请在那个 agent 会话内部调用 `evolver`（一次一轮），OpenClaw 会在这次运行中接管 stdout 指令。对 OpenClaw 用户还要特别注意：`AGENT_NAME`（或 `AGENT_SESSIONS_DIR`）必须指向真正在产生 session 的那个 agent 目录（`~/.openclaw/agents/<名字>/sessions/`），否则 evolver 会回退到读自己的日志，看上去就像在"空转"。
 
 ## 适用 / 不适用场景
 
@@ -416,7 +416,7 @@ EVOLVE_REPORT_TOOL=feishu-card
 永久关闭：
 
 ```bash
-EVOLVER_VALIDATOR_ENABLED=0 evolver run --loop
+EVOLVER_VALIDATOR_ENABLED=0 evolver --loop
 ```
 
 ### 自动 GitHub Issue 上报
@@ -426,7 +426,7 @@ EVOLVER_VALIDATOR_ENABLED=0 evolver run --loop
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `EVOLVER_AUTO_ISSUE` | `true` | 是否启用自动 issue 上报 |
-| `EVOLVER_ISSUE_REPO` | `autogame-17/capability-evolver` | 目标 GitHub 仓库（owner/repo） |
+| `EVOLVER_ISSUE_REPO` | `EvoMap/evolver` | 目标 GitHub 仓库（owner/repo） |
 | `EVOLVER_ISSUE_COOLDOWN_MS` | `86400000`（24 小时） | 同类错误签名的冷却期 |
 | `EVOLVER_ISSUE_MIN_STREAK` | `5` | 触发上报所需的最低连续失败次数 |
 
@@ -473,33 +473,6 @@ EVOLVER_VALIDATOR_ENABLED=0 evolver run --loop
 1. **单进程锁**：进化引擎禁止生成子进化进程（防止 Fork 炸弹）。
 2. **稳定性优先**：如果近期错误率较高，强制进入修复模式，暂停创新功能。
 3. **环境检测**：外部集成（如 Git 同步）仅在检测到相应插件存在时才会启用。
-
-## Public 发布
-
-本仓库为公开发行版本。
-
-- 构建公开产物：`npm run build`
-- 发布公开产物：`npm run publish:public`
-- 演练：`DRY_RUN=true npm run publish:public`
-
-必填环境变量：
-
-- `PUBLIC_REMOTE`（默认：`public`）
-- `PUBLIC_REPO`（例如 `EvoMap/evolver`）
-- `PUBLIC_OUT_DIR`（默认：`dist-public`）
-- `PUBLIC_USE_BUILD_OUTPUT`（默认：`true`）
-
-可选环境变量：
-
-- `SOURCE_BRANCH`（默认：`main`）
-- `PUBLIC_BRANCH`（默认：`main`）
-- `RELEASE_TAG`（例如 `v1.0.41`）
-- `RELEASE_TITLE`（例如 `v1.0.41 - GEP protocol`）
-- `RELEASE_NOTES` 或 `RELEASE_NOTES_FILE`
-- `GITHUB_TOKEN`（或 `GH_TOKEN` / `GITHUB_PAT`，用于创建 GitHub Release）
-- `RELEASE_SKIP`（`true` 则跳过创建 GitHub Release；默认会创建）
-- `RELEASE_USE_GH`（`true` 则使用 `gh` CLI，否则默认走 GitHub API）
-- `PUBLIC_RELEASE_ONLY`（`true` 则仅为已存在的 tag 创建 Release；不发布代码）
 
 ## 版本号规则（SemVer）
 
@@ -557,4 +530,4 @@ MAJOR.MINOR.PATCH
 
 ## 许可证
 
-[MIT](https://opensource.org/licenses/MIT)
+[GPL-3.0-or-later](https://opensource.org/licenses/GPL-3.0)

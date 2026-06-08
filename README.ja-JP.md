@@ -181,7 +181,7 @@ evolver --loop
 | ループ (`evolver --loop`) | 適応的スリープ付きのデーモンループで上記を繰り返す |
 | OpenClaw 内 | ホストランタイムが `sessions_spawn(...)` などの stdout ディレクティブを解釈 |
 
-> **`--loop` は「動作中のエージェントをリアルタイムで支援する」モードではありません。** ループモードはバックグラウンドの自己メンテナンス（validator 実行、worker タスク、ATP マーチャント自動配信、solidify）のためのもので、その stdout は evolver 自身が消費します。したがって、たとえ OpenClaw / Cursor / Claude Code がインストールされていても、ループモードで出力される `sessions_spawn(...)` ディレクティブはこれらのホストには届きません。evolver にライブセッションを観察・補助させたい場合は、そのエージェントセッションの **内部から** `evolver run` を呼び出してください（OpenClaw はその単一ランの stdout ディレクティブを取り込みます）。OpenClaw ユーザーはさらに、`AGENT_NAME`（または `AGENT_SESSIONS_DIR`）が実際にセッションを生成しているエージェントのディレクトリ（`~/.openclaw/agents/<名前>/sessions/`）を指していることを確認してください -- さもないと evolver は自身のログにフォールバックし、「空転している」ように見えます。
+> **`--loop` は「動作中のエージェントをリアルタイムで支援する」モードではありません。** ループモードはバックグラウンドの自己メンテナンス（validator 実行、worker タスク、ATP マーチャント自動配信、solidify）のためのもので、その stdout は evolver 自身が消費します。したがって、たとえ OpenClaw / Cursor / Claude Code がインストールされていても、ループモードで出力される `sessions_spawn(...)` ディレクティブはこれらのホストには届きません。evolver にライブセッションを観察・補助させたい場合は、そのエージェントセッションの **内部から** `evolver` を呼び出してください（OpenClaw はその単一ランの stdout ディレクティブを取り込みます）。OpenClaw ユーザーはさらに、`AGENT_NAME`（または `AGENT_SESSIONS_DIR`）が実際にセッションを生成しているエージェントのディレクトリ（`~/.openclaw/agents/<名前>/sessions/`）を指していることを確認してください -- さもないと evolver は自身のログにフォールバックし、「空転している」ように見えます。
 
 ## 対象ユーザー
 
@@ -404,7 +404,7 @@ EVOLVE_REPORT_TOOL=feishu-card
 永続的にオプトアウト：
 
 ```bash
-EVOLVER_VALIDATOR_ENABLED=0 evolver run --loop
+EVOLVER_VALIDATOR_ENABLED=0 evolver --loop
 ```
 
 ### GitHub Issue 自動報告
@@ -414,7 +414,7 @@ evolver が持続的な失敗（失敗ループまたは高い失敗率での繰
 | 変数 | デフォルト | 説明 |
 |----------|---------|-------------|
 | `EVOLVER_AUTO_ISSUE` | `true` | 自動 issue 報告の有効/無効 |
-| `EVOLVER_ISSUE_REPO` | `autogame-17/capability-evolver` | ターゲット GitHub リポジトリ (owner/repo) |
+| `EVOLVER_ISSUE_REPO` | `EvoMap/evolver` | ターゲット GitHub リポジトリ (owner/repo) |
 | `EVOLVER_ISSUE_COOLDOWN_MS` | `86400000` (24h) | 同じエラーシグネチャのクールダウン期間 |
 | `EVOLVER_ISSUE_MIN_STREAK` | `5` | トリガーする最小連続失敗ストリーク |
 
@@ -456,33 +456,6 @@ evolver が持続的な失敗（失敗ループまたは高い失敗率での繰
 
 `index.js` と `evolve.js` の `sessions_spawn(...)` 文字列は、直接の関数呼び出しではなく、**stdout へのテキスト出力**です。これらが解釈されるかどうかはホストランタイム（例: OpenClaw プラットフォーム）に依存します。evolver 自体は `sessions_spawn` を実行可能コードとして呼び出しません。
 
-## パブリックリリース
-
-このリポジトリはパブリックディストリビューションです。
-
-- パブリック出力のビルド: `npm run build`
-- パブリック出力の公開: `npm run publish:public`
-- ドライラン: `DRY_RUN=true npm run publish:public`
-
-必須環境変数:
-
-- `PUBLIC_REMOTE` (デフォルト: `public`)
-- `PUBLIC_REPO` (例: `EvoMap/evolver`)
-- `PUBLIC_OUT_DIR` (デフォルト: `dist-public`)
-- `PUBLIC_USE_BUILD_OUTPUT` (デフォルト: `true`)
-
-オプションの環境変数:
-
-- `SOURCE_BRANCH` (デフォルト: `main`)
-- `PUBLIC_BRANCH` (デフォルト: `main`)
-- `RELEASE_TAG` (例: `v1.0.41`)
-- `RELEASE_TITLE` (例: `v1.0.41 - GEP protocol`)
-- `RELEASE_NOTES` または `RELEASE_NOTES_FILE`
-- GitHub Release 作成用の `GITHUB_TOKEN`（または `GH_TOKEN` / `GITHUB_PAT`）
-- `RELEASE_SKIP` (GitHub Release の作成をスキップするには `true`；デフォルトは作成)
-- `RELEASE_USE_GH` (GitHub API の代わりに `gh` CLI を使用するには `true`)
-- `PUBLIC_RELEASE_ONLY` (既存のタグに対して Release のみを作成するには `true`；公開なし)
-
 ## バージョニング (SemVer)
 
 MAJOR.MINOR.PATCH
@@ -517,8 +490,12 @@ MAJOR.MINOR.PATCH
 
 ## ロードマップ
 
-- 1 分間のデモワークフローを追加
-- 代替案との比較表を追加
+方針であり確約ではありません。最新のバックログは [GitHub Issues](https://github.com/EvoMap/evolver/issues) を参照してください。
+
+- **オンボーディング**: 1 分間のクイックスタートデモと、他のエージェント進化手法との比較表。
+- **GEP 統合の深化**: より豊富なシグナル抽出と Gene / Capsule 選択、および再利用アナリティクス。
+- **メモリとスキル**: セッション結果を再利用可能な Gene / Capsule へより速く蒸留。
+- **対応ランタイムの拡大**: Cursor / Claude Code / Codex / Kiro / opencode / OpenClaw 以外のホスト統合を拡充。
 
 ## Star 履歴
 

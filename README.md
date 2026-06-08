@@ -203,7 +203,7 @@ When running inside a host runtime (e.g., [OpenClaw](https://openclaw.com)), the
 | Loop (`evolver --loop`) | Repeats the above in a daemon loop with adaptive sleep |
 | Inside OpenClaw | Host runtime interprets stdout directives like `sessions_spawn(...)` |
 
-> **`--loop` is not a real-time agent assistant.** Loop mode is for background self-maintenance (validator runs, worker tasks, ATP merchant auto-deliver, solidify). Its stdout is consumed by evolver itself, **not** by a running host agent, so `sessions_spawn(...)` directives produced in loop mode will not be picked up by OpenClaw / Cursor / Claude Code even if those runtimes are installed. If you want evolver to observe and advise a live agent session, call `evolver run` from **inside** that agent session (OpenClaw will pick up the stdout directives on that single run). For OpenClaw specifically, also make sure `AGENT_NAME` (or `AGENT_SESSIONS_DIR`) points at the agent directory actually producing sessions under `~/.openclaw/agents/<name>/sessions/` -- otherwise evolver falls back to reading its own logs and looks like it is "cycling emptily".
+> **`--loop` is not a real-time agent assistant.** Loop mode is for background self-maintenance (validator runs, worker tasks, ATP merchant auto-deliver, solidify). Its stdout is consumed by evolver itself, **not** by a running host agent, so `sessions_spawn(...)` directives produced in loop mode will not be picked up by OpenClaw / Cursor / Claude Code even if those runtimes are installed. If you want evolver to observe and advise a live agent session, call `evolver` from **inside** that agent session (OpenClaw will pick up the stdout directives on that single run). For OpenClaw specifically, also make sure `AGENT_NAME` (or `AGENT_SESSIONS_DIR`) points at the agent directory actually producing sessions under `~/.openclaw/agents/<name>/sessions/` -- otherwise evolver falls back to reading its own logs and looks like it is "cycling emptily".
 
 ## Who This Is For / Not For
 
@@ -442,7 +442,7 @@ Persistent flag override: when the env is unset, the runtime reads `~/.evomap/fe
 To opt out permanently:
 
 ```bash
-EVOLVER_VALIDATOR_ENABLED=0 evolver run --loop
+EVOLVER_VALIDATOR_ENABLED=0 evolver --loop
 ```
 
 ### Auto GitHub Issue Reporting
@@ -452,7 +452,7 @@ When the evolver detects persistent failures (failure loop or recurring errors w
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EVOLVER_AUTO_ISSUE` | `true` | Enable/disable auto issue reporting |
-| `EVOLVER_ISSUE_REPO` | `autogame-17/capability-evolver` | Target GitHub repository (owner/repo) |
+| `EVOLVER_ISSUE_REPO` | `EvoMap/evolver` | Target GitHub repository (owner/repo) |
 | `EVOLVER_ISSUE_COOLDOWN_MS` | `86400000` (24h) | Cooldown period for the same error signature |
 | `EVOLVER_ISSUE_MIN_STREAK` | `5` | Minimum consecutive failure streak to trigger |
 
@@ -494,33 +494,6 @@ External Gene/Capsule assets ingested via `scripts/a2a_ingest.js` are staged in 
 
 The `sessions_spawn(...)` strings in `index.js` and `evolve.js` are **text output to stdout**, not direct function calls. Whether they are interpreted depends on the host runtime (e.g., OpenClaw platform). The evolver itself does not invoke `sessions_spawn` as executable code.
 
-## Public Release
-
-This repository is the public distribution.
-
-- Build public output: `npm run build`
-- Publish public output: `npm run publish:public`
-- Dry run: `DRY_RUN=true npm run publish:public`
-
-Required env vars:
-
-- `PUBLIC_REMOTE` (default: `public`)
-- `PUBLIC_REPO` (e.g. `EvoMap/evolver`)
-- `PUBLIC_OUT_DIR` (default: `dist-public`)
-- `PUBLIC_USE_BUILD_OUTPUT` (default: `true`)
-
-Optional env vars:
-
-- `SOURCE_BRANCH` (default: `main`)
-- `PUBLIC_BRANCH` (default: `main`)
-- `RELEASE_TAG` (e.g. `v1.0.41`)
-- `RELEASE_TITLE` (e.g. `v1.0.41 - GEP protocol`)
-- `RELEASE_NOTES` or `RELEASE_NOTES_FILE`
-- `GITHUB_TOKEN` (or `GH_TOKEN` / `GITHUB_PAT`) for GitHub Release creation
-- `RELEASE_SKIP` (`true` to skip creating a GitHub Release; default is to create)
-- `RELEASE_USE_GH` (`true` to use `gh` CLI instead of GitHub API)
-- `PUBLIC_RELEASE_ONLY` (`true` to only create a Release for an existing tag; no publish)
-
 ## Versioning (SemVer)
 
 MAJOR.MINOR.PATCH
@@ -555,8 +528,12 @@ Clone it into any directory you like. If you use [OpenClaw](https://openclaw.com
 
 ## Roadmap
 
-- Add a one-minute demo workflow
-- Add a comparison table vs alternatives
+Directional, not commitments — the live backlog lives in [GitHub Issues](https://github.com/EvoMap/evolver/issues).
+
+- **Onboarding**: a one-minute quickstart demo and a comparison table vs. alternative agent-evolution approaches.
+- **Deeper GEP integration**: richer signal extraction and Gene / Capsule selection, plus reuse analytics.
+- **Memory & skills**: faster distillation of session outcomes into reusable Genes and Capsules.
+- **Broader runtime coverage**: more first-class host integrations beyond Cursor / Claude Code / Codex / Kiro / opencode / OpenClaw.
 
 ## Star History
 
@@ -579,7 +556,7 @@ Clone it into any directory you like. If you use [OpenClaw](https://openclaw.com
 
 ## License
 
-[MIT](https://opensource.org/licenses/MIT)
+[GPL-3.0-or-later](https://opensource.org/licenses/GPL-3.0)
 
 > Core evolution engine modules are distributed in obfuscated form to protect intellectual property. Source: [EvoMap/evolver](https://github.com/EvoMap/evolver).
 
