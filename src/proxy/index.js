@@ -8,6 +8,9 @@ const { buildMessagesHandler, canonicalizeForBedrock, supportsAdaptiveThinking }
 const { ensureEnvelope } = require('./envelope');
 const { buildResponsesHandler, buildChatCompletionsHandler } = require('./router/responses_route');
 const { buildGeminiHandler } = require('./router/gemini_route');
+const { buildModelsHandler } = require('./router/models_route');
+const { buildOllamaHandler } = require('./router/ollama_route');
+const { buildVertexHandler } = require('./router/vertex_route');
 const { SyncEngine } = require('./sync/engine');
 const { LifecycleManager } = require('./lifecycle/manager');
 const { TaskMonitor } = require('./task/monitor');
@@ -26,6 +29,7 @@ function _defaultDataDir() { return getEvomapPath('mailbox'); }
 
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com';
+const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
 
 function isAllowedOpenAIHostname(hostname) {
   const h = String(hostname || '').toLowerCase();
@@ -69,6 +73,24 @@ function makeGeminiGatewayError(err, fallbackStatus = 502) {
   const name = err && err.name ? String(err.name) : '';
   const isTimeout = name === 'TimeoutError' || name === 'AbortError';
   const out = new Error(isTimeout ? 'gemini upstream timed out' : 'gemini upstream request failed');
+  out.statusCode = isTimeout ? 504 : fallbackStatus;
+  out.cause = err;
+  return out;
+}
+
+function makeOllamaGatewayError(err, fallbackStatus = 502) {
+  const name = err && err.name ? String(err.name) : '';
+  const isTimeout = name === 'TimeoutError' || name === 'AbortError';
+  const out = new Error(isTimeout ? 'ollama upstream timed out' : 'ollama upstream request failed');
+  out.statusCode = isTimeout ? 504 : fallbackStatus;
+  out.cause = err;
+  return out;
+}
+
+function makeVertexGatewayError(err, fallbackStatus = 502) {
+  const name = err && err.name ? String(err.name) : '';
+  const isTimeout = name === 'TimeoutError' || name === 'AbortError';
+  const out = new Error(isTimeout ? 'vertex upstream timed out' : 'vertex upstream request failed');
   out.statusCode = isTimeout ? 504 : fallbackStatus;
   out.cause = err;
   return out;
@@ -120,6 +142,33 @@ function planAssetSearch(body = {}) {
   return { path: '/a2a/assets/search', query: buildAssetSearchQuery(body) };
 }
 
+// Asset-search client-side relief. The hub meters /a2a/assets/search per client
+// IP, so an entire proxy fleet sharing one egress (plus the operator hitting it
+// manually) collapses into a single bucket and 429s itself. We cache identical
+// signal searches briefly, collapse concurrent duplicates into one request, and
+// honour the hub's Retry-After so we stop hammering — and stop consuming the
+// shared bucket — during a rate-limit window. Tunable via env for ops.
+const ASSET_SEARCH_CACHE_TTL_MS = Number(process.env.EVOMAP_ASSET_SEARCH_CACHE_TTL_MS) || 30_000;
+const ASSET_SEARCH_CACHE_MAX = Number(process.env.EVOMAP_ASSET_SEARCH_CACHE_MAX) || 256;
+// How long a cached result may still be served as "stale" while we are in a
+// rate-limit cooldown (better to return slightly-old discovery results than to
+// fail the caller and fire a doomed request).
+const ASSET_SEARCH_STALE_GRACE_MS = 5 * 60_000;
+
+// Extract a retry delay (ms) from a hub 429 response: prefer the JSON body's
+// ms-precision retry_after_ms (buildRateLimitBody), fall back to the RFC
+// Retry-After header (seconds). Returns 0 when neither is present.
+function parseRetryAfterMs(res, bodyText) {
+  try {
+    const body = bodyText ? JSON.parse(bodyText) : null;
+    const ms = Number(body && body.retry_after_ms);
+    if (Number.isFinite(ms) && ms > 0) return Math.ceil(ms);
+  } catch { /* body is not JSON; fall through to the header */ }
+  const secs = Number(res && res.headers && res.headers.get && res.headers.get('retry-after'));
+  if (Number.isFinite(secs) && secs > 0) return secs * 1000;
+  return 0;
+}
+
 class EvoMapProxy {
   constructor(opts = {}) {
     // evolver#567: default to the canonical Hub URL (config.resolveHubUrl →
@@ -138,6 +187,7 @@ class EvoMapProxy {
     this._anthropicBaseUrl = (opts.anthropicBaseUrl || process.env.EVOMAP_ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
     this._openaiBaseUrl = String(opts.openaiBaseUrl || process.env.EVOMAP_OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, '');
     this._geminiBaseUrl = String(opts.geminiBaseUrl || process.env.EVOMAP_GEMINI_BASE_URL || DEFAULT_GEMINI_BASE_URL).replace(/\/+$/, '');
+    this._ollamaBaseUrl = String(opts.ollamaBaseUrl || process.env.EVOMAP_OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL).replace(/\/+$/, '');
     this._openaiBaseUrlTrusted = !!opts.openaiBaseUrl;
 
     this.store = null;
@@ -151,6 +201,11 @@ class EvoMapProxy {
     this.traceControl = null;
     this._traceBackfillDraining = false;
     this._started = false;
+
+    // Asset-search relief state (see ASSET_SEARCH_* constants above).
+    this._searchCache = new Map();      // key -> { value, expiresAt, staleUntil }
+    this._searchInflight = new Map();   // key -> Promise (concurrent dedup)
+    this._searchCooldownUntil = 0;      // epoch ms; >now means hub rate-limited us
   }
 
   async start() {
@@ -225,10 +280,7 @@ class EvoMapProxy {
       assetFetch: (body) => this._proxyHttp('/a2a/fetch', this._wrapA2a('fetch', body)),
       // GET (not POST). planAssetSearch() picks signal-search vs semantic-search
       // by whether the body carries a free-text `query` or a `signals` list.
-      assetSearch: (body) => {
-        const plan = planAssetSearch(body);
-        return this._proxyHttp(plan.path, null, { method: 'GET', query: plan.query });
-      },
+      assetSearch: (body) => this._assetSearch(body),
       assetValidate: (body) => this._proxyHttp('/a2a/validate', this._wrapA2a('validate', body)),
       // ATP passthrough (#460 Bug 2): merchant/consumer flows that used to call
       // hub directly via src/atp/hubClient.js must route through the proxy when
@@ -276,6 +328,23 @@ class EvoMapProxy {
       traceStore: this.store,
       onTraceQueued: () => this.sync?.notifyNewOutbound(),
     });
+    const modelsHandler = buildModelsHandler({
+      // Models list goes straight to the native upstream (never bedrock — /v1/models is an Anthropic/OpenAI
+      // API concept), so call the provider methods directly rather than the EVOMAP_UPSTREAM-aware closure.
+      anthropicProxy: (reqPath, body, opts) => this._proxyAnthropic(reqPath, body, opts),
+      openAIProxy: (reqPath, body, opts) => this._proxyOpenAIResponses(reqPath, body, opts),
+      logger: this.logger,
+    });
+    const ollamaProxy = (reqPath, body, opts) => this._proxyOllama(reqPath, body, opts);
+    const ollamaTraceOpts = { logger: this.logger, traceStore: this.store, onTraceQueued: () => this.sync?.notifyNewOutbound() };
+    const ollamaChatHandler = buildOllamaHandler({ ollamaProxy, apiPath: '/api/chat', ...ollamaTraceOpts });
+    const ollamaGenerateHandler = buildOllamaHandler({ ollamaProxy, apiPath: '/api/generate', ...ollamaTraceOpts });
+    const vertexHandler = buildVertexHandler({
+      vertexProxy: (reqPath, body, opts) => this._proxyVertex(reqPath, body, opts),
+      logger: this.logger,
+      traceStore: this.store,
+      onTraceQueued: () => this.sync?.notifyNewOutbound(),
+    });
 
     const routes = buildRoutes(this.store, proxyHandlers, this.taskMonitor, {
       dmHandler: this.dmHandler,
@@ -286,6 +355,10 @@ class EvoMapProxy {
       responsesHandler,
       geminiHandler,
       chatCompletionsHandler,
+      modelsHandler,
+      ollamaChatHandler,
+      ollamaGenerateHandler,
+      vertexHandler,
     });
 
     const OUTBOUND_ROUTES = [
@@ -492,10 +565,102 @@ class EvoMapProxy {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw Object.assign(new Error(`Hub ${res.status}: ${text}`), { statusCode: res.status });
+      const err = Object.assign(new Error(`Hub ${res.status}: ${text}`), { statusCode: res.status });
+      if (res.status === 429) err.retryAfterMs = parseRetryAfterMs(res, text);
+      throw err;
     }
 
     return res.json();
+  }
+
+  // Build the hub asset-search plan with this node's identity attached, so the
+  // hub's bulkFetchGuard / per-node metering attributes the call to the right
+  // node instead of treating every fleet member as one anonymous IP. As with
+  // _wrapA2a, we always stamp the proxy's OWN node_id (never a caller-supplied
+  // one) so a client cannot attribute its searches to another node through the
+  // proxy. node_id is advisory; the hub still gates on the Bearer node_secret.
+  _planAssetSearchWithNode(body) {
+    const plan = planAssetSearch(body);
+    const nodeId = this.store && this.store.getState && this.store.getState('node_id');
+    if (nodeId) plan.query = { ...plan.query, node_id: nodeId };
+    return plan;
+  }
+
+  // Stable cache key: same path + same (order-independent) query params.
+  _assetSearchCacheKey(plan) {
+    const q = plan.query || {};
+    const stable = Object.keys(q).sort().map((k) => `${k}=${q[k]}`).join('&');
+    return `${plan.path}?${stable}`;
+  }
+
+  _cacheSearchResult(key, value, now) {
+    // Bound memory: Map preserves insertion order, so the first key is oldest.
+    if (this._searchCache.size >= ASSET_SEARCH_CACHE_MAX && !this._searchCache.has(key)) {
+      const oldest = this._searchCache.keys().next().value;
+      if (oldest !== undefined) this._searchCache.delete(oldest);
+    }
+    this._searchCache.delete(key); // re-insert to refresh recency
+    this._searchCache.set(key, {
+      value,
+      expiresAt: now + ASSET_SEARCH_CACHE_TTL_MS,
+      staleUntil: now + ASSET_SEARCH_CACHE_TTL_MS + ASSET_SEARCH_STALE_GRACE_MS,
+    });
+  }
+
+  // Asset search with client-side relief: fresh-cache short-circuit, concurrent
+  // dedup, and Retry-After-aware cooldown. Preserves the original return shape
+  // and the 429 error contract so existing callers (and their "proceed on local
+  // evidence" fallback) are unaffected.
+  async _assetSearch(body) {
+    const plan = this._planAssetSearchWithNode(body);
+    const key = this._assetSearchCacheKey(plan);
+    const now = Date.now();
+
+    // Fresh cache hit — skip the network entirely.
+    const cached = this._searchCache.get(key);
+    if (cached && cached.expiresAt > now) return cached.value;
+
+    // Cooldown set by a prior 429: don't fire (it would only fail and burn more
+    // of the shared bucket). Serve stale within grace if we have it; otherwise
+    // surface a 429-shaped error so the caller's fallback kicks in with no
+    // wasted round-trip.
+    if (now < this._searchCooldownUntil) {
+      if (cached && cached.staleUntil > now) return cached.value;
+      throw Object.assign(new Error('Hub 429: rate_limited (client cooldown)'), {
+        statusCode: 429,
+        retryAfterMs: this._searchCooldownUntil - now,
+        fromCooldown: true,
+      });
+    }
+
+    // Collapse concurrent identical searches into one in-flight request.
+    const inflight = this._searchInflight.get(key);
+    if (inflight) return inflight;
+
+    const p = (async () => {
+      try {
+        const value = await this._proxyHttp(plan.path, null, { method: 'GET', query: plan.query });
+        this._cacheSearchResult(key, value, Date.now());
+        return value;
+      } catch (err) {
+        if (err && err.statusCode === 429) {
+          const retryAfterMs = Number(err.retryAfterMs) > 0 ? Number(err.retryAfterMs) : ASSET_SEARCH_CACHE_TTL_MS;
+          this._searchCooldownUntil = Date.now() + retryAfterMs;
+          if (this.logger && this.logger.warn) {
+            this.logger.warn(`[proxy] asset search rate-limited by hub; cooling down ${Math.ceil(retryAfterMs / 1000)}s`);
+          }
+          // Prefer serving stale over failing the caller during cooldown.
+          const stale = this._searchCache.get(key);
+          if (stale && stale.staleUntil > Date.now()) return stale.value;
+        }
+        throw err;
+      } finally {
+        this._searchInflight.delete(key);
+      }
+    })();
+
+    this._searchInflight.set(key, p);
+    return p;
   }
 
   // Phase C slice 4 + token mediation: relay to api.anthropic.com. The
@@ -546,12 +711,10 @@ class EvoMapProxy {
     }
 
     const endpoint = `${baseUrl}${reqPath}`;
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: fwd,
-      body: JSON.stringify(body || {}),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const method = (opts.method || 'POST').toUpperCase();
+    const init = { method, headers: fwd, signal: AbortSignal.timeout(timeoutMs) };
+    if (method !== 'GET' && method !== 'HEAD') init.body = JSON.stringify(body || {}); // GET (e.g. /v1/models) sends no body
+    const res = await fetch(endpoint, init);
 
     const headers = Object.fromEntries(res.headers.entries());
     const contentType = (headers['content-type'] || '').toLowerCase();
@@ -606,14 +769,12 @@ class EvoMapProxy {
     timeoutErr.name = 'TimeoutError';
     const abortTimer = setTimeout(() => abortController.abort(timeoutErr), timeoutMs);
     abortTimer.unref?.();
+    const method = (opts.method || 'POST').toUpperCase();
+    const init = { method, headers: fwd, signal: abortController.signal };
+    if (method !== 'GET' && method !== 'HEAD') init.body = JSON.stringify(body || {}); // GET (e.g. /models) sends no body
     let res;
     try {
-      res = await fetch(endpoint, {
-        method: 'POST',
-        headers: fwd,
-        body: JSON.stringify(body || {}),
-        signal: abortController.signal,
-      });
+      res = await fetch(endpoint, init);
     } catch (err) {
       clearTimeout(abortTimer);
       throw makeOpenAIGatewayError(err);
@@ -706,6 +867,96 @@ class EvoMapProxy {
       } finally {
         clearTimeout(abortTimer);
       }
+    };
+
+    return {
+      status: res.status,
+      headers,
+      stream: isStream ? res.body : null,
+      json: isStream ? null : async () => JSON.parse(await readText()),
+      text: isStream ? null : readText,
+    };
+  }
+
+  // Ollama native passthrough (local model server). Native paths /api/chat | /api/generate, body carries the
+  // model + `stream` flag. Ollama is typically local with no auth; forward verbatim to EVOMAP_OLLAMA_BASE_URL
+  // (default 127.0.0.1:11434). Optional bearer for a remote/protected Ollama via EVOMAP_OLLAMA_API_KEY. Streaming
+  // is newline-delimited JSON (NDJSON), not SSE — content-type application/json + chunked. No translation.
+  async _proxyOllama(reqPath, body, opts = {}) {
+    const baseUrl = (opts.baseUrl || this._ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL).replace(/\/+$/, '');
+    const timeoutMs = opts.timeoutMs || 60_000;
+    const fwd = { 'content-type': 'application/json' };
+    const upstreamKey = process.env.EVOMAP_OLLAMA_API_KEY || '';
+    if (upstreamKey) fwd.authorization = `Bearer ${upstreamKey}`;
+
+    const endpoint = `${baseUrl}${reqPath}`;
+    const abortController = new AbortController();
+    const timeoutErr = new Error('ollama upstream timed out');
+    timeoutErr.name = 'TimeoutError';
+    const abortTimer = setTimeout(() => abortController.abort(timeoutErr), timeoutMs);
+    abortTimer.unref?.();
+    let res;
+    try {
+      res = await fetch(endpoint, { method: 'POST', headers: fwd, body: JSON.stringify(body || {}), signal: abortController.signal });
+    } catch (err) {
+      clearTimeout(abortTimer);
+      throw makeOllamaGatewayError(err);
+    }
+
+    const headers = Object.fromEntries(res.headers.entries());
+    // Ollama streams when the request body has stream:true (default true). The reply is chunked NDJSON
+    // (application/json), not SSE, so detect by the request flag, not content-type — buffering a stream would
+    // break the client. Non-stream (stream:false) returns a single JSON object.
+    const isStream = !(body && body.stream === false);
+    if (isStream) clearTimeout(abortTimer);
+
+    const readText = async () => {
+      try { return await res.text(); } catch (err) { throw makeOllamaGatewayError(err); } finally { clearTimeout(abortTimer); }
+    };
+
+    return {
+      status: res.status,
+      headers,
+      stream: isStream ? res.body : null,
+      json: isStream ? null : async () => JSON.parse(await readText()),
+      text: isStream ? null : readText,
+    };
+  }
+
+  // Vertex AI Gemini passthrough. Same Gemini body as the AI Studio route, but a Vertex path
+  // (/v1/projects/<p>/locations/<l>/publishers/google/models/<model>:generateContent), a region-specific base
+  // (<location>-aiplatform.googleapis.com, computed by the route and passed via opts.baseUrl), and OAuth Bearer
+  // auth. The access token comes from EVOMAP_VERTEX_ACCESS_TOKEN (provisioned/refreshed by the daemon via
+  // `gcloud auth print-access-token` or a token sidecar); SA-key auto-minting is a follow-up. No translation.
+  async _proxyVertex(reqPath, body, opts = {}) {
+    const baseUrl = String(opts.baseUrl || '').replace(/\/+$/, '');
+    if (!baseUrl) { const e = new Error('vertex base url required'); e.statusCode = 500; throw e; }
+    const token = process.env.EVOMAP_VERTEX_ACCESS_TOKEN || '';
+    if (!token) { const e = new Error('vertex access token required'); e.statusCode = 401; throw e; }
+    const timeoutMs = opts.timeoutMs || 60_000;
+    const fwd = { 'content-type': 'application/json', authorization: `Bearer ${token}` };
+
+    const endpoint = `${baseUrl}${reqPath}`;
+    const abortController = new AbortController();
+    const timeoutErr = new Error('vertex upstream timed out');
+    timeoutErr.name = 'TimeoutError';
+    const abortTimer = setTimeout(() => abortController.abort(timeoutErr), timeoutMs);
+    abortTimer.unref?.();
+    let res;
+    try {
+      res = await fetch(endpoint, { method: 'POST', headers: fwd, body: JSON.stringify(body || {}), signal: abortController.signal });
+    } catch (err) {
+      clearTimeout(abortTimer);
+      throw makeVertexGatewayError(err);
+    }
+
+    const headers = Object.fromEntries(res.headers.entries());
+    const contentType = (headers['content-type'] || '').toLowerCase();
+    const isStream = contentType.includes('text/event-stream') || /:streamGenerateContent(\b|\?|$)/.test(reqPath);
+    if (isStream) clearTimeout(abortTimer);
+
+    const readText = async () => {
+      try { return await res.text(); } catch (err) { throw makeVertexGatewayError(err); } finally { clearTimeout(abortTimer); }
     };
 
     return {
@@ -984,5 +1235,6 @@ module.exports = {
   buildAssetSearchQuery,
   buildSemanticSearchQuery,
   planAssetSearch,
+  parseRetryAfterMs,
   resolveOpenAIBaseUrl,
 };

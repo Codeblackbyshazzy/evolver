@@ -30,7 +30,12 @@ describe('EvoMapProxy._proxyOpenAIResponses', () => {
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         const raw = Buffer.concat(chunks).toString();
-        captured.push({ path: req.url, headers: req.headers, body: JSON.parse(raw || '{}') });
+        captured.push({ path: req.url, method: req.method, rawBody: raw, headers: req.headers, body: JSON.parse(raw || '{}') });
+        if (req.method === 'GET' && req.url === '/v1/models') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ object: 'list', data: [{ id: 'gpt-4o', object: 'model' }] }));
+          return;
+        }
         if (req.url === '/v1/responses-stream') {
           res.writeHead(200, { 'content-type': 'text/event-stream' });
           res.write('data: {"type":"response.created"}\n\n');
@@ -108,6 +113,18 @@ describe('EvoMapProxy._proxyOpenAIResponses', () => {
     assert.notEqual(captured[0].headers.host, '127.0.0.1:19820');
     assert.equal(captured[0].headers['openai-organization'], 'org_123');
     assert.equal(captured[0].headers['x-stainless-package-version'], 'codex-test');
+  });
+
+  it('forwards a GET (e.g. /models) with no body', async () => {
+    process.env.EVOMAP_OPENAI_API_KEY = 'sk-upstream';
+    const res = await proxy._proxyOpenAIResponses('/models', null, { method: 'GET', inboundHeaders: {} });
+    assert.equal(res.status, 200);
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].path, '/v1/models');
+    assert.equal(captured[0].method, 'GET');
+    assert.equal(captured[0].rawBody, '');                       // GET must send NO body
+    const body = await res.json();
+    assert.equal(body.data[0].id, 'gpt-4o');                     // model list returned
   });
 
   it('does not use inbound x-api-key as an OpenAI upstream credential', async () => {

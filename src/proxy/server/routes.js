@@ -12,6 +12,10 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
     responsesHandler,
     geminiHandler,
     chatCompletionsHandler,
+    modelsHandler,
+    ollamaChatHandler,
+    ollamaGenerateHandler,
+    vertexHandler,
   } = extensions || {};
   const routes = {
     // -- Mailbox --
@@ -486,6 +490,22 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
   if (chatCompletionsHandler) {
     // OpenAI Chat Completions ingress (cursor's OpenAI mode + generic OpenAI clients) → OpenAI upstream.
     routes['POST /v1/chat/completions'] = chatCompletionsHandler;
+  }
+  if (modelsHandler) {
+    // Model-list probe (codex/opencode/cursor/SDKs hit it on startup) → routed by anthropic-version header to
+    // the Anthropic or OpenAI upstream's /v1/models, so the probe never 404s.
+    routes['GET /v1/models'] = modelsHandler;
+  }
+  if (ollamaChatHandler) {
+    // Ollama native ingress (local/self-hosted models) → Ollama upstream, NDJSON streaming.
+    routes['POST /api/chat'] = ollamaChatHandler;
+  }
+  if (ollamaGenerateHandler) {
+    routes['POST /api/generate'] = ollamaGenerateHandler;
+  }
+  if (vertexHandler) {
+    // Vertex AI Gemini native path: project/location/model:action across fixed segments + :modelAction.
+    routes['POST /v1/projects/:project/locations/:location/publishers/google/models/:modelAction'] = vertexHandler;
   }
 
   return routes;

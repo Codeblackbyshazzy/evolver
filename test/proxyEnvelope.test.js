@@ -239,6 +239,12 @@ describe('proxy /asset/* -> hub envelope wrapping (e2e)', () => {
     assert.equal(sent.method, 'GET');
     // GET requests carry no body -- and in particular no envelope.
     assert.deepEqual(sent.body, {});
-    assert.deepEqual(sent.query, { signals: 'log_error,timeout', limit: '5' });
+    // The proxy stamps its own node_id for hub-side attribution (bulkFetchGuard
+    // / per-node metering), alongside the comma-joined signals.
+    assert.deepEqual(sent.query, {
+      signals: 'log_error,timeout',
+      limit: '5',
+      node_id: proxy.store.getState('node_id'),
+    });
   });
 });
