@@ -50,6 +50,8 @@ describe('schema/prompt enum consistency', () => {
     const { VALID_CATEGORIES: fromGene } = require('../src/gep/schemas/gene');
     assert.deepEqual(VALID_CATEGORIES, fromGene,
       'protocol.js must re-export VALID_CATEGORIES from gene.js — see src/gep/schemas/protocol.js');
+    assert.deepEqual(VALID_CATEGORIES, ['repair', 'optimize', 'innovate', 'explore'],
+      "standard Gene categories must not include Hub-only values such as 'regulatory'");
     assert.ok(VALID_CATEGORIES.includes('explore'),
       "'explore' must remain a valid category — removing it requires audit of strategy.js presets");
   });
@@ -92,6 +94,8 @@ describe('schema/prompt enum consistency', () => {
         `prompt is missing enum literal ${lit} — likely drift between schemas/protocol.js and prompt.js. ` +
         `Add it to renderEnum() / renderEnumList() output, do not hardcode.`);
     }
+    assert.equal(prompt.includes('regulatory'), false,
+      "the LLM-facing prompt must not advertise the Hub-only 'regulatory' category");
   });
 
   it('prompt.js does NOT contain hardcoded category enums (drift guard)', () => {

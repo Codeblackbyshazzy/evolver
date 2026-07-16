@@ -129,6 +129,50 @@ describe('loadGenes', () => {
   beforeEach(setupTempEnv);
   afterEach(teardownTempEnv);
 
+  it('supports side-effect-free reads when the store does not exist', () => {
+    const assetsDir = process.env.GEP_ASSETS_DIR;
+    fs.rmSync(assetsDir, { recursive: true, force: true });
+    const { loadGenesReadOnly, loadCapsulesReadOnly } = freshRequire();
+
+    const genes = loadGenesReadOnly();
+    const capsules = loadCapsulesReadOnly();
+
+    const integrity = genes.find(g => g.id === 'gene_tool_integrity');
+    assert.ok(integrity, 'read-only load should expose the bundled starter genes');
+    assert.deepEqual(integrity.routing_hint, { tier: 'cheap', reasoning_level: 'low' });
+    assert.deepEqual(capsules, []);
+    assert.equal(fs.existsSync(assetsDir), false, 'read-only loads must not create the asset-store directory');
+  });
+
+  it('reads legacy runtime assets without migrating them in read-only mode', () => {
+    teardownTempEnv();
+    setupTempEnv();
+    delete process.env.GEP_ASSETS_DIR;
+
+    const legacyDir = path.join(tmpDir, 'assets', 'gep');
+    const targetDir = path.join(tmpDir, '.evolver', 'gep');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'genes.json'), JSON.stringify({
+      version: 1,
+      genes: [{ type: 'Gene', id: 'legacy_gene' }],
+    }), 'utf8');
+    fs.writeFileSync(path.join(legacyDir, 'genes.jsonl'), JSON.stringify({
+      type: 'Gene', id: 'legacy_jsonl_gene',
+    }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(legacyDir, 'capsules.json'), JSON.stringify({
+      version: 1,
+      capsules: [{ type: 'Capsule', id: 'legacy_capsule' }],
+    }), 'utf8');
+    fs.writeFileSync(path.join(legacyDir, 'capsules.jsonl'), JSON.stringify({
+      type: 'Capsule', id: 'legacy_jsonl_capsule',
+    }) + '\n', 'utf8');
+
+    const { loadGenesReadOnly, loadCapsulesReadOnly } = freshRequire();
+    assert.deepEqual(loadGenesReadOnly().map(g => g.id).sort(), ['legacy_gene', 'legacy_jsonl_gene']);
+    assert.deepEqual(loadCapsulesReadOnly().map(c => c.id).sort(), ['legacy_capsule', 'legacy_jsonl_capsule']);
+    assert.equal(fs.existsSync(targetDir), false, 'read-only loads must not migrate legacy assets');
+  });
+
   it('returns default genes when no files exist', () => {
     const { ensureAssetFiles, loadGenes } = freshRequire();
     ensureAssetFiles();

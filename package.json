@@ -1,6 +1,6 @@
 {
   "name": "@evomap/evolver",
-  "version": "1.91.2",
+  "version": "1.92.0",
   "description": "A GEP-powered self-evolution engine for AI agents. Features automated log analysis and Genome Evolution Protocol (GEP) for auditable, reusable evolution assets.",
   "main": "index.js",
   "bin": {
@@ -41,6 +41,7 @@
     "@evomap/atp-sdk": "^0.1.0",
     "@evomap/gep-sdk": "^1.5.0",
     "dotenv": "^16.4.7",
+    "eventsource": "^4.1.0",
     "undici": "^7.28.0"
   },
   "devDependencies": {

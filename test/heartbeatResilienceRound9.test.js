@@ -23,6 +23,8 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
+const { spawnSync } = require('node:child_process');
 
 // Unconditionally pin the test secret inside test scope (a host-exported
 // A2A_NODE_SECRET would otherwise win and make assertions host-dependent
@@ -44,6 +46,7 @@ const {
   _driveHeartbeatTickForTesting,
   _bumpTickGenerationForTesting,
   _resetHubNodeSecretStateForTesting,
+  _resetCachedNodeIdForTesting,
 } = a2a._testing;
 
 function nextTick() { return new Promise((r) => setImmediate(r)); }
@@ -73,13 +76,15 @@ function installTempEvolverHome() {
 }
 
 describe('round-9: reauth 401-vs-403 split + shorter backoff', () => {
-  let origFetch, origHubUrl, origAllow, restoreEvolverHome;
+  let origFetch, origHubUrl, origAllow, origNodeId, restoreEvolverHome;
   beforeEach(() => {
     _resetHeartbeatStateForTesting();
     _resetHubNodeSecretStateForTesting();
+    _resetCachedNodeIdForTesting();
     origFetch = global.fetch;
     origHubUrl = process.env.A2A_HUB_URL;
     origAllow = process.env.EVOMAP_HUB_ALLOW_INSECURE;
+    origNodeId = process.env.A2A_NODE_ID;
     restoreEvolverHome = installTempEvolverHome();
     process.env.A2A_HUB_URL = 'http://localhost:19999';
     process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
@@ -88,9 +93,11 @@ describe('round-9: reauth 401-vs-403 split + shorter backoff', () => {
     global.fetch = origFetch;
     if (origHubUrl === undefined) delete process.env.A2A_HUB_URL; else process.env.A2A_HUB_URL = origHubUrl;
     if (origAllow === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE; else process.env.EVOMAP_HUB_ALLOW_INSECURE = origAllow;
+    if (origNodeId === undefined) delete process.env.A2A_NODE_ID; else process.env.A2A_NODE_ID = origNodeId;
     if (restoreEvolverHome) restoreEvolverHome();
     restoreEvolverHome = null;
     _resetHubNodeSecretStateForTesting();
+    _resetCachedNodeIdForTesting();
     _resetHeartbeatStateForTesting();
   });
 
@@ -113,6 +120,8 @@ describe('round-9: reauth 401-vs-403 split + shorter backoff', () => {
   });
 
   test('genuine 403 (node_secret_invalid) with a failed re-hello clears the diverged secret', async () => {
+    const nodeId = 'node_aaaaaaaaaaaa';
+    process.env.A2A_NODE_ID = nodeId;
     global.fetch = async (url) => {
       const u = String(url || '');
       if (u.indexOf('/a2a/hello') !== -1) return res(500, { ok: false, error: 'hub_down' });
@@ -126,7 +135,20 @@ describe('round-9: reauth 401-vs-403 split + shorter backoff', () => {
     assert.equal(result.error, 'secret_diverged_cleared');
     assert.equal(s.consecutiveReauthFailures, 0, 'secret divergence clear must not arm the reauth counter');
     assert.equal(s.reauthBackoffUntil, 0, 'secret divergence clear must not arm reauth backoff');
-    assert.equal(fs.existsSync(path.join(process.env.EVOLVER_HOME, 'node_secret_env_suppressed')), true);
+    const suppressionFile = path.join(process.env.EVOLVER_HOME, 'node_secret_env_suppressed');
+    const expectedMarker = 'sha256:' + crypto.createHash('sha256').update('a'.repeat(64)).digest('hex');
+    assert.equal(fs.readFileSync(path.join(process.env.EVOLVER_HOME, 'node_id'), 'utf8'), nodeId);
+    assert.equal(fs.readFileSync(suppressionFile, 'utf8'), expectedMarker);
+
+    const restart = spawnSync(process.execPath, ['-e', [
+      `const a2a = require(${JSON.stringify(require.resolve('../src/gep/a2aProtocol'))});`,
+      `process.stdout.write(a2a.getHubNodeSecret(${JSON.stringify(nodeId)}) === null ? 'suppressed' : 'active');`,
+    ].join('\n')], {
+      env: { ...process.env, EVOLVER_HOME: process.env.EVOLVER_HOME },
+      encoding: 'utf8',
+    });
+    assert.equal(restart.status, 0, restart.stderr);
+    assert.equal(restart.stdout, 'suppressed', 'restart must not select the rejected env secret again');
   });
 });
 
@@ -135,6 +157,7 @@ describe('round-9: non-sleep reauth escape hatch', () => {
   beforeEach(() => {
     _resetHeartbeatStateForTesting();
     _resetHubNodeSecretStateForTesting();
+    _resetCachedNodeIdForTesting();
     origFetch = global.fetch;
     origHubUrl = process.env.A2A_HUB_URL;
     origAllow = process.env.EVOMAP_HUB_ALLOW_INSECURE;
@@ -149,6 +172,7 @@ describe('round-9: non-sleep reauth escape hatch', () => {
     if (restoreEvolverHome) restoreEvolverHome();
     restoreEvolverHome = null;
     _resetHubNodeSecretStateForTesting();
+    _resetCachedNodeIdForTesting();
     _resetHeartbeatStateForTesting();
   });
 
@@ -210,6 +234,7 @@ describe('round-9: tick-generation guard', () => {
   beforeEach(() => {
     _resetHeartbeatStateForTesting();
     _resetHubNodeSecretStateForTesting();
+    _resetCachedNodeIdForTesting();
     origFetch = global.fetch;
     origHubUrl = process.env.A2A_HUB_URL;
     origAllow = process.env.EVOMAP_HUB_ALLOW_INSECURE;
@@ -224,6 +249,7 @@ describe('round-9: tick-generation guard', () => {
     if (restoreEvolverHome) restoreEvolverHome();
     restoreEvolverHome = null;
     _resetHubNodeSecretStateForTesting();
+    _resetCachedNodeIdForTesting();
     _resetHeartbeatStateForTesting();
   });
 

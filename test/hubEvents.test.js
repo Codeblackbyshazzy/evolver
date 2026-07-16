@@ -5,9 +5,13 @@ const os = require('os');
 const path = require('path');
 const {
   sendHeartbeat,
+  stopHeartbeat,
   getHubEvents,
   consumeHubEvents,
 } = require('../src/gep/a2aProtocol');
+const {
+  _resetHubEventBufferForTesting,
+} = require('../src/gep/a2aProtocol')._testing;
 
 describe('consumeHubEvents / getHubEvents', () => {
   let originalFetch;
@@ -109,6 +113,43 @@ describe('consumeHubEvents / getHubEvents', () => {
     await new Promise(r => setTimeout(r, 100));
 
     assert.ok(!pollCalled, 'should NOT call /a2a/events/poll when has_pending_events is absent');
+  });
+
+  it('does not poll or buffer events from a heartbeat response that arrives after stop', async () => {
+    let resolveHeartbeat;
+    let pollCalls = 0;
+    const heartbeatResponse = new Promise((resolve) => {
+      resolveHeartbeat = resolve;
+    });
+    global.fetch = async (url) => {
+      if (url.includes('/a2a/events/poll')) {
+        pollCalls += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            events: [{ id: 'evt-after-stop', type: 'task_available', payload: {} }],
+          }),
+        };
+      }
+      return heartbeatResponse;
+    };
+
+    _resetHubEventBufferForTesting();
+    const pendingHeartbeat = sendHeartbeat();
+    stopHeartbeat();
+    resolveHeartbeat({
+      ok: true,
+      status: 200,
+      json: async () => ({ status: 'ok', has_pending_events: true }),
+      text: async () => '',
+    });
+
+    await pendingHeartbeat;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(pollCalls, 0, 'a pre-stop heartbeat must not start a late event poll');
+    assert.deepEqual(consumeHubEvents(), [], 'a pre-stop heartbeat must not write the event buffer');
   });
 
   it('handles poll returning events in payload.events format', async () => {

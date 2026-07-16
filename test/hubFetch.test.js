@@ -23,6 +23,21 @@ function freshHubFetch() {
   return require('../src/gep/hubFetch');
 }
 
+function streamingResponse(status, headers = {}) {
+  let cancelCalls = 0;
+  const body = new ReadableStream({
+    cancel() {
+      cancelCalls++;
+    },
+  });
+  return {
+    response: new Response(body, { status, headers }),
+    get cancelCalls() {
+      return cancelCalls;
+    },
+  };
+}
+
 describe('hubFetch — unit', () => {
   let savedEnv;
   let capturedUrl;
@@ -74,6 +89,248 @@ describe('hubFetch — unit', () => {
     await hubFetch('https://hub.example.com/a2a/heartbeat', { method: 'POST' });
     assert.ok(capturedOptions.dispatcher instanceof Agent,
       'dispatcher must be an undici Agent (overrides NODE_TLS_REJECT_UNAUTHORIZED=0)');
+  });
+
+  it('uses a dedicated TLS-pinned dispatcher for Hub event streams', async () => {
+    const { hubEventStreamFetch } = hubFetchMod;
+    await hubEventStreamFetch('https://hub.example.com/a2a/events/stream', {
+      headers: { Authorization: 'Bearer test-secret' },
+    });
+
+    assert.ok(capturedOptions.dispatcher instanceof Agent);
+    assert.equal(capturedOptions.headers.Authorization, 'Bearer test-secret');
+    assert.equal(capturedOptions.redirect, 'manual');
+    const cfg = hubFetchMod._getHubFetchConfigForTest();
+    assert.equal(cfg.eventStream.rejectUnauthorized, true);
+    assert.equal(cfg.eventStream.headersTimeout, 30_000);
+    assert.equal(cfg.eventStream.bodyTimeout, 0);
+  });
+
+  it('cancels non-200 streaming responses while preserving EventSource error metadata', async () => {
+    for (const allowInsecure of [false, true]) {
+      if (allowInsecure) process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
+      else delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+
+      const stream = streamingResponse(503, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+      });
+      hubFetchMod._setFetchImplForTest(() => Promise.resolve(stream.response));
+
+      const response = await hubFetchMod.hubEventStreamFetch(
+        allowInsecure
+          ? 'http://127.0.0.1:3000/a2a/events/stream'
+          : 'https://hub.example.com/a2a/events/stream',
+        {},
+      );
+
+      assert.equal(stream.cancelCalls, 1);
+      assert.equal(response.status, 503);
+      assert.equal(response.headers.get('content-type'), 'text/event-stream; charset=utf-8');
+    }
+  });
+
+  it('cancels 200 responses with a non-event-stream content type', async () => {
+    const stream = streamingResponse(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+    });
+    hubFetchMod._setFetchImplForTest(() => Promise.resolve(stream.response));
+
+    const response = await hubFetchMod.hubEventStreamFetch(
+      'https://hub.example.com/a2a/events/stream',
+      {},
+    );
+
+    assert.equal(stream.cancelCalls, 1);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8');
+  });
+
+  it('does not cancel a valid event stream response', async () => {
+    const stream = streamingResponse(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+    });
+    hubFetchMod._setFetchImplForTest(() => Promise.resolve(stream.response));
+
+    const response = await hubFetchMod.hubEventStreamFetch(
+      'https://hub.example.com/a2a/events/stream',
+      {},
+    );
+
+    assert.equal(response, stream.response);
+    assert.equal(stream.cancelCalls, 0);
+  });
+
+  it('follows a same-origin HTTPS redirect with authenticated headers', async () => {
+    const { hubEventStreamFetch } = hubFetchMod;
+    const calls = [];
+    const redirectStream = streamingResponse(301, {
+      Location: 'https://evomap.ai/a2a/events/stream?cursor=next',
+    });
+    const eventStream = streamingResponse(200, {
+      'Content-Type': 'text/event-stream',
+    });
+    hubFetchMod._setFetchImplForTest((url, opts) => {
+      calls.push({ url, opts });
+      if (calls.length === 1) {
+        return Promise.resolve(redirectStream.response);
+      }
+      return Promise.resolve(eventStream.response);
+    });
+
+    const signal = AbortSignal.timeout(5_000);
+    const response = await hubEventStreamFetch('https://evomap.ai/a2a/events/stream?cursor=start', {
+      redirect: 'follow',
+      signal,
+      headers: {
+        Authorization: 'Bearer test-secret',
+        'X-EvoMap-Node-Secret-Version': '7',
+      },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(redirectStream.cancelCalls, 1);
+    assert.equal(eventStream.cancelCalls, 0);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].url, 'https://evomap.ai/a2a/events/stream?cursor=start');
+    assert.equal(calls[1].url, 'https://evomap.ai/a2a/events/stream?cursor=next');
+    for (const call of calls) {
+      assert.equal(call.opts.redirect, 'manual');
+      assert.equal(call.opts.headers.Authorization, 'Bearer test-secret');
+      assert.equal(call.opts.headers['X-EvoMap-Node-Secret-Version'], '7');
+      assert.equal(call.opts.signal, signal);
+      assert.ok(call.opts.dispatcher instanceof Agent);
+    }
+  });
+
+  it('cancels redirect responses that cannot be followed without a Location header', async () => {
+    const stream = streamingResponse(307);
+    hubFetchMod._setFetchImplForTest(() => Promise.resolve(stream.response));
+
+    const response = await hubFetchMod.hubEventStreamFetch(
+      'https://evomap.ai/a2a/events/stream',
+      {},
+    );
+
+    assert.equal(stream.cancelCalls, 1);
+    assert.equal(response.status, 307);
+    assert.equal(response.headers.get('location'), null);
+  });
+
+  it('cancels a redirect response when its Location header is malformed', async () => {
+    const { hubEventStreamFetch } = hubFetchMod;
+    const calls = [];
+    const stream = streamingResponse(301, { Location: 'https://[' });
+    hubFetchMod._setFetchImplForTest((url, opts) => {
+      calls.push({ url, opts });
+      return Promise.resolve(stream.response);
+    });
+
+    await assert.rejects(
+      () => hubEventStreamFetch('https://evomap.ai/a2a/events/stream', {}),
+      /Invalid URL/,
+    );
+
+    assert.equal(stream.cancelCalls, 1);
+    assert.equal(calls.length, 1, 'malformed redirect target must not receive a request');
+  });
+
+  it('cancels a redirect response when HTTPS would be downgraded to HTTP', async () => {
+    const { hubEventStreamFetch } = hubFetchMod;
+    const calls = [];
+    const stream = streamingResponse(307, {
+      Location: 'http://evomap.ai/a2a/events/stream',
+    });
+    hubFetchMod._setFetchImplForTest((url, opts) => {
+      calls.push({ url, opts });
+      return Promise.resolve(stream.response);
+    });
+
+    await assert.rejects(
+      () => hubEventStreamFetch('https://evomap.ai/a2a/events/stream', {}),
+      /must use https:\/\//,
+    );
+
+    assert.equal(stream.cancelCalls, 1);
+    assert.equal(calls.length, 1, 'insecure redirect target must not receive a request');
+  });
+
+  it('blocks a www-to-apex redirect before forwarding authenticated headers', async () => {
+    const { hubEventStreamFetch } = hubFetchMod;
+    const calls = [];
+    hubFetchMod._setFetchImplForTest((url, opts) => {
+      calls.push({ url, opts });
+      return Promise.resolve(new Response(null, {
+        status: 301,
+        headers: { Location: 'https://evomap.ai/a2a/events/stream' },
+      }));
+    });
+
+    await assert.rejects(
+      () => hubEventStreamFetch('https://www.evomap.ai/a2a/events/stream', {
+        headers: {
+          Authorization: 'Bearer test-secret',
+          'X-EvoMap-Node-Secret-Version': '7',
+        },
+      }),
+      /untrusted redirect origin/,
+    );
+
+    assert.equal(calls.length, 1, 'apex redirect target must not receive a request');
+    assert.equal(calls[0].url, 'https://www.evomap.ai/a2a/events/stream');
+  });
+
+  it('blocks an untrusted event-stream redirect before forwarding authenticated headers', async () => {
+    const { hubEventStreamFetch } = hubFetchMod;
+    const calls = [];
+    hubFetchMod._setFetchImplForTest((url, opts) => {
+      calls.push({ url, opts });
+      return Promise.resolve(new Response(null, {
+        status: 307,
+        headers: { Location: 'https://attacker.example/a2a/events/stream' },
+      }));
+    });
+
+    await assert.rejects(
+      () => hubEventStreamFetch('https://evomap.ai/a2a/events/stream', {
+        headers: {
+          Authorization: 'Bearer test-secret',
+          'X-EvoMap-Node-Secret-Version': '7',
+        },
+      }),
+      /untrusted redirect origin/,
+    );
+
+    assert.equal(calls.length, 1, 'untrusted redirect target must not receive a request');
+    assert.equal(calls[0].url, 'https://evomap.ai/a2a/events/stream');
+  });
+
+  it('rejects insecure event-stream URLs by default', async () => {
+    const { hubEventStreamFetch } = hubFetchMod;
+    await assert.rejects(
+      () => hubEventStreamFetch('http://hub.example.com/a2a/events/stream', {}),
+      /must use https:\/\//,
+    );
+  });
+
+  it('allows local insecure event streams only through the explicit escape hatch', async () => {
+    const { hubEventStreamFetch } = hubFetchMod;
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
+    await hubEventStreamFetch('http://127.0.0.1:3000/a2a/events/stream', {});
+
+    assert.equal(capturedUrl, 'http://127.0.0.1:3000/a2a/events/stream');
+    assert.equal(capturedOptions.dispatcher, undefined);
+    assert.equal(capturedOptions.redirect, 'error');
+  });
+
+  it('rebuilds the event-stream dispatcher when draining pools', async () => {
+    const { hubEventStreamFetch, drainPool } = hubFetchMod;
+    await hubEventStreamFetch('https://hub.example.com/a2a/events/stream', {});
+    const firstDispatcher = capturedOptions.dispatcher;
+
+    drainPool();
+    await hubEventStreamFetch('https://hub.example.com/a2a/events/stream', {});
+
+    assert.notEqual(capturedOptions.dispatcher, firstDispatcher);
   });
 
   it('defaults Hub connections to IPv4-first fallback to avoid IPv6 VPN leaks', () => {

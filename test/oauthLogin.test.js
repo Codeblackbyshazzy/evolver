@@ -92,7 +92,12 @@ function assertNotBearer(headers, token) {
   }
 }
 
+function fixtureNodeId() {
+  return process.env.A2A_NODE_ID || 'node_abcdef123456';
+}
+
 function writeLegacyNodeSecret(home, secret, version, source) {
+  fs.writeFileSync(path.join(home, 'node_id'), fixtureNodeId(), 'utf8');
   fs.writeFileSync(path.join(home, 'node_secret'), secret, 'utf8');
   if (version) fs.writeFileSync(path.join(home, 'node_secret_version'), String(version), 'utf8');
   if (source) fs.writeFileSync(path.join(home, 'node_secret_source'), source, 'utf8');
@@ -101,9 +106,16 @@ function writeLegacyNodeSecret(home, secret, version, source) {
 function writeMailboxState(home, state) {
   const mailboxDir = path.join(home, 'mailbox');
   fs.mkdirSync(mailboxDir, { recursive: true, mode: 0o700 });
+  const ownedState = Object.assign({}, state);
+  if (
+    !Object.prototype.hasOwnProperty.call(ownedState, 'node_id') &&
+    Object.prototype.hasOwnProperty.call(ownedState, 'node_secret')
+  ) {
+    ownedState.node_id = fixtureNodeId();
+  }
   fs.writeFileSync(
     path.join(mailboxDir, 'state.json'),
-    JSON.stringify(Object.assign({ _schema_version: 1 }, state), null, 2) + '\n',
+    JSON.stringify(Object.assign({ _schema_version: 1 }, ownedState), null, 2) + '\n',
     { encoding: 'utf8', mode: 0o600 },
   );
 }

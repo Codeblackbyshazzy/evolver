@@ -24,6 +24,9 @@ const { hubFetch, sanitizeHubResponseForLog } = require('../gep/hubFetch');
 const TRACE_BACKFILL_DRAIN_MAX_PASSES = 8;
 const TRACE_BACKFILL_STARTUP_DRAIN_MAX_MS = 250;
 const TRACE_BACKFILL_RUNTIME_DRAIN_MAX_MS = 50;
+const HUB_EVENT_RETRY_BASE_MS = 250;
+const HUB_EVENT_RETRY_MAX_MS = 30_000;
+const HUB_EVENT_RETRY_MAX_PENDING = 1_024;
 
 // Lazy via paths.getEvomapPath() — honors EVOLVER_HOME (#114).
 function _defaultDataDir() { return getEvomapPath('mailbox'); }
@@ -243,6 +246,9 @@ class EvoMapProxy {
     this._geminiBaseUrl = String(opts.geminiBaseUrl || process.env.EVOMAP_GEMINI_BASE_URL || DEFAULT_GEMINI_BASE_URL).replace(/\/+$/, '');
     this._ollamaBaseUrl = String(opts.ollamaBaseUrl || process.env.EVOMAP_OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL).replace(/\/+$/, '');
     this._openaiBaseUrlTrusted = !!opts.openaiBaseUrl;
+    this._recoverEventDeliveryAfterWake = typeof opts.recoverEventDeliveryAfterWake === 'function'
+      ? opts.recoverEventDeliveryAfterWake
+      : () => require('../gep/a2aProtocol').recoverEventDeliveryAfterWake();
 
     this.store = null;
     this.server = null;
@@ -255,6 +261,19 @@ class EvoMapProxy {
     this.traceControl = null;
     this._traceBackfillDraining = false;
     this._started = false;
+    this._hubEventRetryBaseMs = Number.isFinite(opts.hubEventRetryBaseMs) && opts.hubEventRetryBaseMs > 0
+      ? opts.hubEventRetryBaseMs
+      : HUB_EVENT_RETRY_BASE_MS;
+    const configuredHubEventRetryMaxMs = Number.isFinite(opts.hubEventRetryMaxMs) && opts.hubEventRetryMaxMs > 0
+      ? opts.hubEventRetryMaxMs
+      : HUB_EVENT_RETRY_MAX_MS;
+    this._hubEventRetryMaxMs = Math.max(configuredHubEventRetryMaxMs, this._hubEventRetryBaseMs);
+    this._hubEventRetryMaxPending = Number.isInteger(opts.hubEventRetryMaxPending) && opts.hubEventRetryMaxPending > 0
+      ? opts.hubEventRetryMaxPending
+      : HUB_EVENT_RETRY_MAX_PENDING;
+    this._pendingHubEvents = new Map();
+    this._hubEventRetryTimer = null;
+    this._hubEventRetryStopped = false;
 
     // Asset-search relief state (see ASSET_SEARCH_* constants above).
     this._searchCache = new Map();      // key -> { value, expiresAt, staleUntil }
@@ -264,6 +283,7 @@ class EvoMapProxy {
 
   async start() {
     if (this._started) throw new Error('Proxy already started');
+    this._hubEventRetryStopped = false;
 
     this.store = new MailboxStore(this.dataDir);
 
@@ -272,6 +292,7 @@ class EvoMapProxy {
       store: this.store,
       logger: this.logger,
       getTaskMeta: () => this.taskMonitor ? this.taskMonitor.getHeartbeatMeta() : {},
+      onWake: this._recoverEventDeliveryAfterWake,
     });
 
     this.taskMonitor = new TaskMonitor({
@@ -315,14 +336,7 @@ class EvoMapProxy {
       onOutboundFlushed: () => this._drainProxyTraceBackfill({
         maxMs: TRACE_BACKFILL_RUNTIME_DRAIN_MAX_MS,
       }),
-      onInboundReceived: () => {
-        try { this.skillUpdater?.pollAndApply(); } catch (e) {
-          this.logger?.warn?.('[proxy] skillUpdater.pollAndApply failed:', e.message);
-        }
-        try { this.traceControl?.pollAndApply(); } catch (e) {
-          this.logger?.warn?.('[proxy] traceControl.pollAndApply failed:', e.message);
-        }
-      },
+      onInboundReceived: () => this._handleInboundReceived(),
     });
 
     const proxyHandlers = {
@@ -473,6 +487,119 @@ class EvoMapProxy {
     };
   }
 
+  _handleInboundReceived() {
+    try { this.skillUpdater?.pollAndApply(); } catch (e) {
+      this.logger?.warn?.('[proxy] skillUpdater.pollAndApply failed:', e.message);
+    }
+    try { this.traceControl?.pollAndApply(); } catch (e) {
+      this.logger?.warn?.('[proxy] traceControl.pollAndApply failed:', e.message);
+    }
+  }
+
+  acceptHubEvents(events) {
+    if (!Array.isArray(events) || events.length === 0) return 0;
+    if (this._hubEventRetryStopped) return 0;
+    let stored = 0;
+    for (const event of events) {
+      const id = event && (typeof event.id === 'string' || typeof event.id === 'number')
+        ? String(event.id)
+        : '';
+      if (!id) {
+        this.logger?.warn?.('[proxy] ignored Hub event without an id');
+        continue;
+      }
+      if (this._pendingHubEvents.has(id)) continue;
+      const normalizedEvent = {
+        id,
+        type: event.type,
+        payload: event.payload,
+        channel: event.channel || 'evomap-hub',
+        priority: event.priority || 'normal',
+        refId: event.ref_id,
+        expiresAt: event.expires_at,
+      };
+      const result = this._persistHubEvent(normalizedEvent);
+      if (result === 'inserted') {
+        stored++;
+      } else if (result === 'failed') {
+        this._queueHubEventRetry(normalizedEvent);
+      }
+    }
+    if (stored > 0) this._handleInboundReceived();
+    return stored;
+  }
+
+  _persistHubEvent(event) {
+    try {
+      const existing = this.store.getById(event.id);
+      this.store.writeInbound(event);
+      return existing ? 'duplicate' : 'inserted';
+    } catch (error) {
+      this.logger?.warn?.(`[proxy] failed to persist Hub event ${event.id}: ${error && error.message || error}`);
+      return 'failed';
+    }
+  }
+
+  _hubEventRetryDelay(failures) {
+    const exponent = Math.min(Math.max(failures - 1, 0), 16);
+    return Math.min(this._hubEventRetryMaxMs, this._hubEventRetryBaseMs * (2 ** exponent));
+  }
+
+  _queueHubEventRetry(event) {
+    if (this._hubEventRetryStopped || this._pendingHubEvents.has(event.id)) return;
+    if (this._pendingHubEvents.size >= this._hubEventRetryMaxPending) {
+      this.logger?.warn?.(`[proxy] Hub event retry queue full; cannot retain event ${event.id}`);
+      return;
+    }
+    const failures = 1;
+    this._pendingHubEvents.set(event.id, {
+      event,
+      failures,
+      nextAttemptAt: Date.now() + this._hubEventRetryDelay(failures),
+    });
+    this._scheduleHubEventRetry();
+  }
+
+  _scheduleHubEventRetry() {
+    if (this._hubEventRetryStopped || this._pendingHubEvents.size === 0) return;
+    if (this._hubEventRetryTimer) clearTimeout(this._hubEventRetryTimer);
+    let nextAttemptAt = Infinity;
+    for (const pending of this._pendingHubEvents.values()) {
+      nextAttemptAt = Math.min(nextAttemptAt, pending.nextAttemptAt);
+    }
+    this._hubEventRetryTimer = setTimeout(() => {
+      this._hubEventRetryTimer = null;
+      this._retryPendingHubEvents();
+    }, Math.max(0, nextAttemptAt - Date.now()));
+    this._hubEventRetryTimer.unref?.();
+  }
+
+  _retryPendingHubEvents() {
+    if (this._hubEventRetryStopped) return;
+    const now = Date.now();
+    let stored = 0;
+    for (const [id, pending] of this._pendingHubEvents) {
+      if (pending.nextAttemptAt > now) continue;
+      const result = this._persistHubEvent(pending.event);
+      if (result === 'failed') {
+        pending.failures += 1;
+        pending.nextAttemptAt = now + this._hubEventRetryDelay(pending.failures);
+        continue;
+      }
+      this._pendingHubEvents.delete(id);
+      if (result === 'inserted') stored++;
+    }
+    if (stored > 0) this._handleInboundReceived();
+    this._scheduleHubEventRetry();
+  }
+
+  _stopHubEventRetries() {
+    this._hubEventRetryStopped = true;
+    if (this._hubEventRetryTimer) clearTimeout(this._hubEventRetryTimer);
+    this._hubEventRetryTimer = null;
+    this._pendingHubEvents.clear();
+  }
+
   _runProxyTraceBackfillPass() {
     try {
       return backfillProxyTraceUploads({
@@ -535,6 +662,7 @@ class EvoMapProxy {
   }
 
   async stop() {
+    this._stopHubEventRetries();
     if (!this._started) return;
     // Tear down in deliberate reverse-of-start order, but don't let one
     // failing step abort the rest: a thrown sync.stop() must not leave the

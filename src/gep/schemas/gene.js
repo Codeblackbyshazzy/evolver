@@ -139,6 +139,8 @@ function validateGene(g) {
   if (!VALID_CATEGORIES.includes(g.category))
                                             throw new Error('Gene.category must be one of: ' + VALID_CATEGORIES.join(', ') + ', got: ' + g.category);
   if (!Array.isArray(g.signals_match))      throw new Error('Gene.signals_match must be an array');
+  if (g.trigger !== undefined && g.trigger !== null && typeof g.trigger !== 'string')
+                                            throw new Error('Gene.trigger must be a string');
   if (!Array.isArray(g.strategy))           throw new Error('Gene.strategy must be an array');
   return true;
 }

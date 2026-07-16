@@ -16,6 +16,7 @@ const assert = require('node:assert');
 
 const { LifecycleManager, HEARTBEAT_BACKOFF_CAP_MS, DEFAULT_HEARTBEAT_INTERVAL } = require('../src/proxy/lifecycle/manager');
 const hubFetchMod = require('../src/gep/hubFetch');
+const protocol = require('../src/gep/a2aProtocol');
 
 const _origInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
 process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
@@ -374,4 +375,57 @@ test('pokeHeartbeatLoop clears the pending timer and resets consecutive failures
 
   mgr._running = false;
   if (mgr._heartbeatTimer) clearTimeout(mgr._heartbeatTimer);
+});
+
+test('unified and proxy wake entries share one transport recovery per wake window', () => {
+  const realNow = Date.now;
+  const realDrainPool = hubFetchMod.drainPool;
+  let now = 10_000;
+  let drainPoolCalls = 0;
+  let wakeHookCalls = 0;
+
+  Date.now = () => now;
+  hubFetchMod.drainPool = () => { drainPoolCalls++; };
+  protocol.registerWakeHook(() => { wakeHookCalls++; });
+
+  try {
+    protocol._testing._resetHeartbeatStateForTesting();
+    protocol.startEventDelivery({
+      hubUrl: 'https://example.invalid',
+      nodeId: 'node_123456789abc',
+      enableSse: false,
+    });
+
+    protocol._runWakeRecovery();
+    assert.strictEqual(drainPoolCalls, 1, 'unified wake must recover transport');
+    assert.strictEqual(wakeHookCalls, 1, 'unified wake must run process hooks');
+
+    assert.strictEqual(protocol.recoverEventDeliveryAfterWake(), true);
+    assert.strictEqual(
+      drainPoolCalls,
+      1,
+      'proxy wake in the same window must not repeat transport recovery'
+    );
+
+    now += 1_001;
+    assert.strictEqual(protocol.recoverEventDeliveryAfterWake(), true);
+    assert.strictEqual(drainPoolCalls, 2, 'transport recovery must be allowed after the window');
+
+    protocol._runWakeRecovery();
+    assert.strictEqual(
+      drainPoolCalls,
+      2,
+      'unified wake after proxy recovery must reuse the claimed transport recovery'
+    );
+    assert.strictEqual(
+      wakeHookCalls,
+      2,
+      'transport-first ordering must not suppress unified non-transport recovery'
+    );
+  } finally {
+    protocol.stopEventDelivery();
+    protocol._testing._resetHeartbeatStateForTesting();
+    hubFetchMod.drainPool = realDrainPool;
+    Date.now = realNow;
+  }
 });

@@ -4,6 +4,7 @@ const { getGepAssetsDir, getBundledGepAssetsDir, getRepoRoot, getSessionScope } 
 const { computeAssetId, SCHEMA_VERSION } = require('./contentHash');
 const { validateGene } = require('./schemas/gene');
 const { validateCapsule } = require('./schemas/capsule');
+const { validateSyncGene } = require('./syncAsset');
 
 // Run validateGene/validateCapsule before persisting. Warn-only -- never throw
 // because losing a write hurts more than persisting a slightly-malformed
@@ -271,6 +272,14 @@ function legacyGepAssetsDir() {
   return baseDir;
 }
 
+function readOnlyRuntimeAssetPath(name) {
+  const target = path.join(getGepAssetsDir(), name);
+  if (fs.existsSync(target) || process.env.GEP_ASSETS_DIR) return target;
+  const legacy = path.join(legacyGepAssetsDir(), name);
+  if (path.resolve(target) !== path.resolve(legacy) && fs.existsSync(legacy)) return legacy;
+  return target;
+}
+
 function migrateLegacyRuntimeAssets() {
   if (process.env.GEP_ASSETS_DIR) return;
   const targetDir = getGepAssetsDir();
@@ -317,13 +326,19 @@ function ensureGenesSeeded() {
   }
 }
 
-function loadGenes(opts) {
-  const options = opts || {};
-  if (options.seed !== false) ensureGenesSeeded();
-  const jsonGenes = readJsonIfExists(genesPath(), getDefaultGenes()).genes || [];
+function _loadGenes(options) {
+  const readOnly = options && options.readOnly === true;
+  const shouldSeed = !options || options.seed !== false;
+  if (!readOnly && shouldSeed) ensureGenesSeeded();
+  let jsonPath = readOnly ? readOnlyRuntimeAssetPath('genes.json') : genesPath();
+  if (readOnly && !fs.existsSync(jsonPath)) {
+    const seed = fs.existsSync(genesSeedPath()) ? genesSeedPath() : bundledGenesPath();
+    if (fs.existsSync(seed)) jsonPath = seed;
+  }
+  const jsonGenes = readJsonIfExists(jsonPath, getDefaultGenes()).genes || [];
   const jsonlGenes = [];
   try {
-    const p = path.join(getGepAssetsDir(), 'genes.jsonl');
+    const p = readOnly ? readOnlyRuntimeAssetPath('genes.jsonl') : path.join(getGepAssetsDir(), 'genes.jsonl');
     if (fs.existsSync(p)) {
       const raw = fs.readFileSync(p, 'utf8');
       raw.split('\n').forEach(line => {
@@ -355,11 +370,21 @@ function loadGenes(opts) {
   return Array.from(unique.values());
 }
 
-function loadCapsules() {
-  const legacy = readJsonIfExists(capsulesPath(), getDefaultCapsules()).capsules || [];
+function loadGenes(options) {
+  return _loadGenes({ readOnly: false, seed: !options || options.seed !== false });
+}
+
+function loadGenesReadOnly() {
+  return _loadGenes({ readOnly: true });
+}
+
+function _loadCapsules(options) {
+  const readOnly = options && options.readOnly === true;
+  const jsonPath = readOnly ? readOnlyRuntimeAssetPath('capsules.json') : capsulesPath();
+  const legacy = readJsonIfExists(jsonPath, getDefaultCapsules()).capsules || [];
   const jsonlCapsules = [];
   try {
-    const p = capsulesJsonlPath();
+    const p = readOnly ? readOnlyRuntimeAssetPath('capsules.jsonl') : capsulesJsonlPath();
     if (fs.existsSync(p)) {
       const raw = fs.readFileSync(p, 'utf8');
       raw.split('\n').forEach(line => {
@@ -379,6 +404,14 @@ function loadCapsules() {
       if (c && c.id) unique.set(String(c.id), c);
   });
   return Array.from(unique.values());
+}
+
+function loadCapsules() {
+  return _loadCapsules({ readOnly: false });
+}
+
+function loadCapsulesReadOnly() {
+  return _loadCapsules({ readOnly: true });
 }
 
 // Grow the tail chunk until it strictly contains the final newline-terminated
@@ -613,8 +646,8 @@ function recomputeAssetId(obj) {
   return obj;
 }
 
-function upsertGene(geneObj) {
-  _validateAssetWarn('Gene', validateGene, geneObj);
+function _upsertGene(geneObj, validatorFn) {
+  _validateAssetWarn('Gene', validatorFn, geneObj);
   ensureSchemaFields(geneObj);
   recomputeAssetId(geneObj);
   ensureGenesSeeded();
@@ -625,6 +658,17 @@ function upsertGene(geneObj) {
     if (idx >= 0) genes[idx] = geneObj; else genes.push(geneObj);
     writeJsonAtomic(genesPath(), { version: current.version || 1, genes });
   });
+}
+
+function upsertGene(geneObj) {
+  return _upsertGene(geneObj, validateGene);
+}
+
+// Hub sync payloads are prepared and validated by syncAsset.js. Keep that
+// compatibility validator on this dedicated write path so Hub-only categories
+// never weaken or produce warnings in the standard Gene persistence path.
+function upsertSyncedGene(geneObj) {
+  return _upsertGene(geneObj, validateSyncGene);
 }
 
 function appendCapsule(capsuleObj) {
@@ -710,10 +754,10 @@ function ensureAssetFiles() {
 }
 
 module.exports = {
-  loadGenes, loadCapsules, readAllEvents, getLastEventId,
+  loadGenes, loadGenesReadOnly, loadCapsules, loadCapsulesReadOnly, readAllEvents, getLastEventId,
   appendEventJsonl, appendCandidateJsonl, appendExternalCandidateJsonl,
   readRecentCandidates, readRecentExternalCandidates,
-  upsertGene, appendCapsule, upsertCapsule,
+  upsertGene, upsertSyncedGene, appendCapsule, upsertCapsule,
   appendFailedCapsule, readRecentFailedCapsules,
   genesPath, capsulesPath, eventsPath, candidatesPath, externalCandidatesPath, failedCapsulesPath,
   pendingSignalsPath, consumePendingSignals,

@@ -1,16 +1,10 @@
-<h1 align="center">🧬 Evolver</h1>
+# 🧬 Evolver
 
-<p align="center">
-  <a href="https://trendshift.io/repositories/26015?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-26015" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/26015" alt="EvoMap%2Fevolver | Trendshift" width="250" height="55"/></a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/EvoMap/evolver/stargazers"><img src="https://img.shields.io/badge/Stars-8.9k-2b3137?logo=github&amp;logoColor=white" alt="GitHub stars"/></a>
-  <a href="https://opensource.org/licenses/GPL-3.0"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg" alt="License: GPL-3.0"/></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D%2018-green.svg" alt="Node.js &gt;= 18"/></a>
-  <a href="https://www.npmjs.com/package/@evomap/evolver"><img src="https://img.shields.io/npm/dm/@evomap/evolver.svg" alt="npm downloads"/></a>
-  <a href="https://arxiv.org/abs/2604.15097"><img src="https://img.shields.io/badge/arXiv-2604.15097-b31b1b.svg" alt="arXiv"/></a>
-</p>
+[![GitHub stars](https://img.shields.io/badge/Stars-8.9k-2b3137?logo=github&logoColor=white)](https://github.com/EvoMap/evolver/stargazers)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://opensource.org/licenses/GPL-3.0)
+[![Node.js >= 18](https://img.shields.io/badge/Node.js-%3E%3D%2018-green.svg)](https://nodejs.org/)
+[![npm downloads](https://img.shields.io/npm/dm/@evomap/evolver.svg)](https://www.npmjs.com/package/@evomap/evolver)
+[![arXiv](https://img.shields.io/badge/arXiv-2604.15097-b31b1b.svg)](https://arxiv.org/abs/2604.15097)
 
 ![Evolver Cover](assets/cover.png)
 

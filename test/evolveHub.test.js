@@ -447,6 +447,28 @@ describe('hubCoordinate', () => {
     assert.ok(result.signals.includes('knowledge'), 'knowledge signal should be injected from hub event');
   });
 
+  it('maps team_disbanded signals while preserving fallback and evidence', async () => {
+    baseStubs();
+    const events = [
+      { type: 'team_disbanded', payload: { team_id: 'team-1' } },
+      { type: 'unknown_event', payload: { value: 'kept' } },
+    ];
+    mockMods['a2aProtocol'].consumeHubEvents = () => events;
+    delete require.cache[require.resolve('../src/evolve/pipeline/hub')];
+    const { hubCoordinate } = require('../src/evolve/pipeline/hub');
+    const previousContext = global._pendingHubEventContext;
+    global._pendingHubEventContext = [];
+    try {
+      const result = await hubCoordinate(buildCtx({ signals: [] }));
+      assert.ok(result.signals.includes('swarm'), 'team_disbanded should inject swarm signal');
+      assert.ok(result.signals.includes('team'), 'team_disbanded should inject team signal');
+      assert.ok(result.signals.includes('hub_event'), 'unknown events should retain the hub_event fallback');
+      assert.deepEqual(global._pendingHubEventContext, events, 'hub events should remain available as evidence');
+    } finally {
+      global._pendingHubEventContext = previousContext;
+    }
+  });
+
   it('preserves existing ctx fields in returned ctx', async () => {
     baseStubs();
     delete require.cache[require.resolve('../src/evolve/pipeline/hub')];

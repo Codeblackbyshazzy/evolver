@@ -6,6 +6,7 @@ const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const { readMailboxStateFile } = require('../mailbox/state');
 const { buildEnvelope } = require('../envelope');
 const crypto = require('crypto');
+const { acquireCanonicalIdentityLock } = require('../../canonicalIdentityLock');
 const {
   hubFetch,
   hubUnreachableBackoffMs,
@@ -146,6 +147,175 @@ function _readLegacyNodeId() {
   return null;
 }
 
+const CANONICAL_CREDENTIAL_SIBLINGS = Object.freeze([
+  'node_secret',
+  'node_secret_version',
+  'node_secret_source',
+  'node_secret_env_suppressed',
+]);
+
+function _readValidNodeIdFile(file) {
+  try {
+    if (!fs.existsSync(file)) return null;
+    const value = fs.readFileSync(file, 'utf8').trim();
+    return NODE_ID_RE.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function _snapshotCanonicalCredentials(nodeIdFile) {
+  const snapshot = new Map();
+  const dir = path.dirname(nodeIdFile);
+  for (const name of CANONICAL_CREDENTIAL_SIBLINGS) {
+    const file = path.join(dir, name);
+    try {
+      snapshot.set(file, fs.readFileSync(file));
+    } catch (e) {
+      if (e && e.code === 'ENOENT') {
+        snapshot.set(file, null);
+        continue;
+      }
+      return null;
+    }
+  }
+  return snapshot;
+}
+
+function _credentialSnapshotHasData(snapshot) {
+  if (!(snapshot instanceof Map)) return false;
+  for (const content of snapshot.values()) {
+    if (content !== null) return true;
+  }
+  return false;
+}
+
+function _clearCanonicalCredentials(nodeIdFile) {
+  const dir = path.dirname(nodeIdFile);
+  let cleared = true;
+  for (const name of CANONICAL_CREDENTIAL_SIBLINGS) {
+    const file = path.join(dir, name);
+    try {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    } catch {
+      cleared = false;
+    }
+    try {
+      if (fs.existsSync(file)) cleared = false;
+    } catch {
+      cleared = false;
+    }
+  }
+  return cleared;
+}
+
+function _preparePrivateFile(file, content) {
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  let fd = null;
+  try {
+    fd = fs.openSync(tmp, 'wx', 0o600);
+    fs.writeFileSync(fd, content);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    return tmp;
+  } catch (e) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* preserve the original write error */ }
+    }
+    try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw e;
+  }
+}
+
+function _commitPreparedFile(tmp, file) {
+  if (process.platform === 'win32') {
+    try { fs.unlinkSync(file); } catch (e) {
+      if (!e || e.code !== 'ENOENT') throw e;
+    }
+  }
+  fs.renameSync(tmp, file);
+  try { fs.chmodSync(file, 0o600); } catch { /* best effort on Windows */ }
+}
+
+function _restoreCanonicalCredentials(snapshot) {
+  if (!(snapshot instanceof Map)) return false;
+  for (const [file, content] of snapshot.entries()) {
+    try {
+      if (content === null) {
+        try { fs.unlinkSync(file); } catch (e) {
+          if (!e || e.code !== 'ENOENT') return false;
+        }
+      } else {
+        const tmp = _preparePrivateFile(file, content);
+        try {
+          _commitPreparedFile(tmp, file);
+        } finally {
+          try { fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+        }
+      }
+    } catch {
+      return false;
+    }
+  }
+  for (const [file, content] of snapshot.entries()) {
+    try {
+      if (content === null) {
+        if (fs.existsSync(file)) return false;
+      } else if (!fs.readFileSync(file).equals(content)) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function _replaceNodeIdFile(file, id) {
+  const expected = Buffer.from(id, 'utf8');
+  const tmp = _preparePrivateFile(file, expected);
+  try {
+    _commitPreparedFile(tmp, file);
+  } finally {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+  }
+  if (!fs.readFileSync(file).equals(expected)) {
+    throw new Error('node_id replacement verification failed');
+  }
+}
+
+function _failClosedCanonicalTuple(nodeIdFile) {
+  const credentialsCleared = _clearCanonicalCredentials(nodeIdFile);
+  if (!credentialsCleared) {
+    // Keep an invalid owner marker in place when an orphan credential cannot
+    // be removed. A missing node_id would let a later exclusive claim turn
+    // the orphan into a readable credential for an unrelated node.
+    try { _replaceNodeIdFile(nodeIdFile, 'invalid'); } catch { /* verified below */ }
+    try {
+      return _readValidNodeIdFile(nodeIdFile) === null && fs.existsSync(nodeIdFile);
+    } catch {
+      return false;
+    }
+  }
+  try { fs.unlinkSync(nodeIdFile); } catch (e) {
+    if (!e || e.code !== 'ENOENT') {
+      try { _replaceNodeIdFile(nodeIdFile, 'invalid'); } catch { /* verified below */ }
+    }
+  }
+  return _readValidNodeIdFile(nodeIdFile) === null;
+}
+
+function _rollbackCanonicalNodeTransition(nodeIdFile, previousId, snapshot) {
+  try { _replaceNodeIdFile(nodeIdFile, previousId); } catch { /* fail closed below */ }
+  if (_readValidNodeIdFile(nodeIdFile) === previousId) {
+    if (_restoreCanonicalCredentials(snapshot)) return true;
+  }
+  // Without an exact A snapshot, neither A nor B may remain claimable.
+  _failClosedCanonicalTuple(nodeIdFile);
+  return false;
+}
+
 // Mirror of src/gep/a2aProtocol.js `_persistNodeId`. Pure-proxy daemons
 // (EVOMAP_PROXY=1, no a2aProtocol heartbeat thread) mint their own
 // node_id and ONLY persist it to MailboxStore state.json. The legacy
@@ -177,25 +347,31 @@ function _readLegacyNodeId() {
 // MailboxStore state.json (`evolver reset-local-secret`).
 function _persistLegacyNodeId(id) {
   if (!id || !NODE_ID_RE.test(id)) return;
+  const canonicalTarget = getEvomapPath('node_id');
   const targets = [
-    getEvomapPath('node_id'),
+    canonicalTarget,
     path.resolve(__dirname, '..', '..', '..', '.evomap_node_id'),
   ];
   // Try targets in order until one succeeds, matching the read order in
   // _readLegacyNodeId. We only need ONE persistent copy; once the home
   // path takes the write, the install-root path is unused.
   for (const file of targets) {
+    let prepared = null;
+    let releaseCanonicalLock = null;
+    if (file === canonicalTarget) {
+      try {
+        releaseCanonicalLock = acquireCanonicalIdentityLock(file);
+      } catch {
+        // Never fall through to the install-local identity while another
+        // process may be mutating the canonical tuple.
+        return;
+      }
+    }
     try {
       // Skip if the file already matches — common steady-state path,
       // saves a syscall storm under heartbeat backoff doubling.
-      try {
-        if (fs.existsSync(file)) {
-          const existing = fs.readFileSync(file, 'utf8').trim();
-          if (existing === id) return;
-        }
-      } catch {
-        // Unreadable -- treat as missing and try to write.
-      }
+      const existing = _readValidNodeIdFile(file);
+      if (existing === id) return;
       const dir = path.dirname(file);
       try {
         if (!fs.existsSync(dir)) {
@@ -207,19 +383,78 @@ function _persistLegacyNodeId(id) {
         // may still work.
         continue;
       }
-      // Atomic write: a sibling evolver process (mixed-mode upgrade, two
-      // proxy daemons started by hand) could otherwise race on this
-      // path and leave a half-written file. Matches the pattern in
-      // a2aProtocol.js `_persistNodeSecret`.
-      const tmp = file + '.' + process.pid + '.tmp';
-      fs.writeFileSync(tmp, id, { encoding: 'utf8', mode: 0o600 });
-      fs.renameSync(tmp, file);
+      const isCanonicalTransition = file === canonicalTarget
+        && existing !== id;
+      const credentialSnapshot = isCanonicalTransition
+        ? _snapshotCanonicalCredentials(file)
+        : null;
+      if (isCanonicalTransition && !credentialSnapshot) return;
+      const hasCanonicalCredentials = _credentialSnapshotHasData(credentialSnapshot);
+      const requiresCredentialInvalidation = isCanonicalTransition
+        && (Boolean(existing) || hasCanonicalCredentials);
+      const canRestorePreviousOwner = Boolean(existing);
+
+      // Prepare the exact bytes before invalidating A's credential tuple.
+      // The same file is committed after clear-before; it is not rewritten.
+      prepared = _preparePrivateFile(file, Buffer.from(id, 'utf8'));
+      if (requiresCredentialInvalidation && !_clearCanonicalCredentials(file)) {
+        try { fs.unlinkSync(prepared); } catch { /* best-effort cleanup */ }
+        prepared = null;
+        const recovered = canRestorePreviousOwner
+          ? _rollbackCanonicalNodeTransition(file, existing, credentialSnapshot)
+          : _failClosedCanonicalTuple(file);
+        if (!recovered) {
+          const err = new Error('failed to restore canonical identity after credential invalidation failure');
+          err.code = 'CANONICAL_IDENTITY_TRANSITION_UNSAFE';
+          throw err;
+        }
+        return;
+      }
+
+      try {
+        _commitPreparedFile(prepared, file);
+        prepared = null;
+        if (_readValidNodeIdFile(file) !== id) {
+          throw new Error('node_id replacement verification failed');
+        }
+      } catch (e) {
+        if (requiresCredentialInvalidation) {
+          const recovered = canRestorePreviousOwner
+            ? _rollbackCanonicalNodeTransition(file, existing, credentialSnapshot)
+            : _failClosedCanonicalTuple(file);
+          if (!recovered) {
+            const err = new Error('failed to restore canonical identity after node_id replacement failure');
+            err.code = 'CANONICAL_IDENTITY_TRANSITION_UNSAFE';
+            throw err;
+          }
+          return;
+        }
+        throw e;
+      }
+
+      if (requiresCredentialInvalidation && !_clearCanonicalCredentials(file)) {
+        const recovered = canRestorePreviousOwner
+          ? _rollbackCanonicalNodeTransition(file, existing, credentialSnapshot)
+          : _failClosedCanonicalTuple(file);
+        if (!recovered) {
+          const err = new Error('failed to invalidate canonical credentials after node_id transition');
+          err.code = 'CANONICAL_IDENTITY_TRANSITION_UNSAFE';
+          throw err;
+        }
+        return;
+      }
       return;
-    } catch {
+    } catch (e) {
+      if (e && e.code === 'CANONICAL_IDENTITY_TRANSITION_UNSAFE') throw e;
       // Best-effort: continue to the next candidate. If both fail (no
       // home, no writable install root) we accept the legacy file is
       // unavailable — the proxy will still function, it just cannot
       // unify state-file suffixes with a co-resident a2aProtocol path.
+    } finally {
+      if (prepared) {
+        try { fs.unlinkSync(prepared); } catch { /* best-effort cleanup */ }
+      }
+      if (releaseCanonicalLock) releaseCanonicalLock();
     }
   }
 }
@@ -445,11 +680,12 @@ function normalizeNodeSecretEnvSuppression(value) {
 }
 
 class LifecycleManager {
-  constructor({ hubUrl, store, logger, getTaskMeta } = {}) {
+  constructor({ hubUrl, store, logger, getTaskMeta, onWake } = {}) {
     this.hubUrl = (hubUrl || process.env.A2A_HUB_URL || '').replace(/\/+$/, '');
     this.store = store;
     this.logger = logger || console;
     this.getTaskMeta = getTaskMeta || null;
+    this.onWake = typeof onWake === 'function' ? onWake : null;
     this._heartbeatTimer = null;
     this._running = false;
     this._startedAt = null;
@@ -468,6 +704,7 @@ class LifecycleManager {
       : null);
     this._envSuppressionClearedForSecret = null;
     this._suppressEnvSecret = Boolean(this._envSecretSuppressionMarker && getEnvNodeSecret());
+    this._deliveryIdentityListeners = new Set();
 
     // H4 fix: persist the legacy node_id file as soon as the in-memory
     // node_id is known, NOT only after a successful hello(). The original
@@ -535,6 +772,20 @@ class LifecycleManager {
       return storeSecret === envSecret ? storeVersion : null;
     }
     return validStoreSecret ? storeVersion : null;
+  }
+
+  onDeliveryIdentityChange(listener) {
+    if (typeof listener !== 'function') return () => {};
+    this._deliveryIdentityListeners.add(listener);
+    return () => this._deliveryIdentityListeners.delete(listener);
+  }
+
+  _notifyDeliveryIdentityChange() {
+    for (const listener of Array.from(this._deliveryIdentityListeners)) {
+      try { listener(); } catch {
+        this.logger.warn?.('[lifecycle] delivery identity listener failed');
+      }
+    }
   }
 
   /**
@@ -881,6 +1132,7 @@ class LifecycleManager {
       }
 
       this.store.setState('node_id', nodeId);
+      this._notifyDeliveryIdentityChange();
       // Unify proxy node_id with the legacy GEP file. Without this, the
       // proxy-only fast path (EVOMAP_PROXY=1) never seeds
       // ~/.evomap/node_id and `_shortNodeIdForStatePath` in a2aProtocol
@@ -1054,6 +1306,7 @@ class LifecycleManager {
           envSuppressed: this.store.getState('node_secret_env_suppressed') || '',
         });
         this.logger.warn('[lifecycle] local in-memory node_secret is stale; preserving newer disk hub-rotated secret');
+        this._notifyDeliveryIdentityChange();
         return;
       } catch (err) {
         const reason = err && (err.code || err.name) ? (err.code || err.name) : 'error';
@@ -1074,6 +1327,7 @@ class LifecycleManager {
     // Suppress only the exact env secret that was just proven stale. If no
     // env secret is present, do not leave a marker that blocks a future reset.
     this._markCurrentEnvSecretSuppressed();
+    this._notifyDeliveryIdentityChange();
   }
 
   _emitManualResetNeeded() {
@@ -1436,6 +1690,13 @@ class LifecycleManager {
             } catch (_) { /* logger broken; non-fatal */ }
           }
           this.pokeHeartbeatLoop();
+          if (this.onWake) {
+            try {
+              this.onWake();
+            } catch (err) {
+              this.logger.warn?.(`[lifecycle] wake recovery callback failed: ${err && err.message || err}`);
+            }
+          }
         }
       } catch (err) {
         try { this.logger.error(`[lifecycle] drift detector threw: ${err && err.message}`); }

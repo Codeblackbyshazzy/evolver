@@ -141,6 +141,39 @@ function replaceStateFile(stateFile, state) {
   bestEffortChmod(stateFile, PRIVATE_FILE_MODE);
 }
 
+function mergeMailboxState(diskState, nextState, updatedKeys) {
+  const next = isPlainState(nextState) ? nextState : {};
+  const disk = isPlainState(diskState) ? diskState : null;
+  const hasDiskState = Boolean(disk);
+  const merged = hasDiskState ? { ...disk } : {};
+  const updatedSet = updatedKeys ? new Set(Array.from(updatedKeys)) : null;
+  const keys = updatedSet ? Array.from(updatedSet) : Object.keys(next);
+  const touchesNodeSecretTuple = keys.some((key) => MAILBOX_NODE_SECRET_TUPLE_KEY_SET.has(key));
+  const preserveDiskNodeSecretTuple = touchesNodeSecretTuple
+    && hasDiskState
+    && isHubRotatedNodeSecretState(disk)
+    && !isFullNodeSecretTupleUpdate(updatedSet);
+
+  for (const key of keys) {
+    if (MAILBOX_NODE_SECRET_STATE_KEY_SET.has(key) && hasDiskState && (!updatedSet || !updatedSet.has(key))) {
+      continue;
+    }
+    if (
+      MAILBOX_NODE_SECRET_TUPLE_KEY_SET.has(key) &&
+      preserveDiskNodeSecretTuple &&
+      !canApplyPartialNodeSecretTupleWrite(key, disk, next)
+    ) {
+      continue;
+    }
+    if (!Object.prototype.hasOwnProperty.call(next, key)) {
+      delete merged[key];
+      continue;
+    }
+    merged[key] = next[key];
+  }
+  return merged;
+}
+
 /**
  * Merge a partial state write with the latest on-disk state.
  *
@@ -157,38 +190,35 @@ function replaceStateFile(stateFile, state) {
 function writeMergedMailboxStateFile(stateFile, nextState, updatedKeys) {
   const releaseLock = acquireStateFileLock(stateFile);
   try {
-    const next = isPlainState(nextState) ? nextState : {};
     const disk = readMailboxStateFile(stateFile);
-    const hasDiskState = isPlainState(disk);
-    const merged = hasDiskState ? { ...disk } : {};
-    const updatedSet = updatedKeys ? new Set(Array.from(updatedKeys)) : null;
-    const keys = updatedSet ? Array.from(updatedSet) : Object.keys(next);
-    const touchesNodeSecretTuple = keys.some((key) => MAILBOX_NODE_SECRET_TUPLE_KEY_SET.has(key));
-    const preserveDiskNodeSecretTuple = touchesNodeSecretTuple
-      && hasDiskState
-      && isHubRotatedNodeSecretState(disk)
-      && !isFullNodeSecretTupleUpdate(updatedSet);
-
-    for (const key of keys) {
-      if (MAILBOX_NODE_SECRET_STATE_KEY_SET.has(key) && hasDiskState && (!updatedSet || !updatedSet.has(key))) {
-        continue;
-      }
-      if (
-        MAILBOX_NODE_SECRET_TUPLE_KEY_SET.has(key) &&
-        preserveDiskNodeSecretTuple &&
-        !canApplyPartialNodeSecretTupleWrite(key, disk, next)
-      ) {
-        continue;
-      }
-      if (!Object.prototype.hasOwnProperty.call(next, key)) {
-        delete merged[key];
-        continue;
-      }
-      merged[key] = next[key];
-    }
-
+    const merged = mergeMailboxState(disk, nextState, updatedKeys);
     replaceStateFile(stateFile, merged);
     return merged;
+  } finally {
+    releaseLock();
+  }
+}
+
+/**
+ * Conditionally update mailbox state while holding the state-file lock.
+ * The callback returns `{ nextState, updatedKeys }`, or null to fail closed
+ * without writing. This keeps owner checks and legacy node_id binding in the
+ * same critical section as the secret tuple mutation.
+ *
+ * @param {string} stateFile
+ * @param {(state: Record<string, unknown>|null) => {nextState: Record<string, unknown>, updatedKeys: Iterable<string>}|null} buildUpdate
+ * @returns {{updated: boolean, state: Record<string, unknown>|null}}
+ */
+function updateMergedMailboxStateFile(stateFile, buildUpdate) {
+  if (typeof buildUpdate !== 'function') throw new TypeError('buildUpdate must be a function');
+  const releaseLock = acquireStateFileLock(stateFile);
+  try {
+    const disk = readMailboxStateFile(stateFile);
+    const update = buildUpdate(isPlainState(disk) ? { ...disk } : null);
+    if (!update) return { updated: false, state: disk };
+    const merged = mergeMailboxState(disk, update.nextState, update.updatedKeys);
+    replaceStateFile(stateFile, merged);
+    return { updated: true, state: merged };
   } finally {
     releaseLock();
   }
@@ -204,4 +234,5 @@ module.exports = {
   readMailboxStateFile,
   isHubRotatedNodeSecretState,
   writeMergedMailboxStateFile,
+  updateMergedMailboxStateFile,
 };

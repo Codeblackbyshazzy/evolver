@@ -35,6 +35,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawn } = require('child_process');
 
 // hubFetch refuses to route through global.fetch for https://example.test
 // unless EVOMAP_HUB_ALLOW_INSECURE=1. Tests below stub global.fetch.
@@ -55,6 +56,7 @@ const {
   _persistLastUpdateStateForTesting,
   _getLastUpdateStatePathForTesting,
   _resetLastUpdateStateForTesting,
+  _resetHubNodeSecretStateForTesting,
 } = a2aProtocol._testing;
 
 test.after(() => {
@@ -214,6 +216,419 @@ test('proxy hello in MIXED MODE (store has its own id, legacy file holds a DIFFE
     // The post-fix assertion: legacy file must now equal STORE_ID.
     assert.strictEqual(fs.readFileSync(legacyFile, 'utf8').trim(), STORE_ID,
       'fix: legacy file must be overwritten with the store id to avoid suffix drift');
+  });
+});
+
+test('proxy store-wins transition clears canonical credentials before node A becomes node B', async () => {
+  const credentialFiles = {
+    node_secret: 'a'.repeat(64),
+    node_secret_version: '7',
+    node_secret_source: 'hub_rotate',
+    node_secret_env_suppressed: 'sha256:' + 'b'.repeat(64),
+  };
+  const dir = makeFakeEvomapDir((evomap) => {
+    fs.writeFileSync(path.join(evomap, 'node_id'), LEGACY_ID, { mode: 0o600 });
+    for (const [name, value] of Object.entries(credentialFiles)) {
+      fs.writeFileSync(path.join(evomap, name), value, { mode: 0o600 });
+    }
+  });
+  await withFakeEvomapDir(dir, async () => {
+    const savedEnv = {
+      A2A_NODE_SECRET: process.env.A2A_NODE_SECRET,
+      EVOMAP_NODE_SECRET: process.env.EVOMAP_NODE_SECRET,
+      A2A_NODE_SECRET_VERSION: process.env.A2A_NODE_SECRET_VERSION,
+      EVOMAP_NODE_SECRET_VERSION: process.env.EVOMAP_NODE_SECRET_VERSION,
+      A2A_HUB_TOKEN: process.env.A2A_HUB_TOKEN,
+      A2A_HUB_URL: process.env.A2A_HUB_URL,
+    };
+    try {
+      for (const key of Object.keys(savedEnv)) delete process.env[key];
+      process.env.A2A_HUB_URL = 'https://example.test';
+      _resetHubNodeSecretStateForTesting();
+
+      const store = makeStore({ node_id: STORE_ID });
+      new LifecycleManager({ hubUrl: 'https://example.test', store, logger: silentLogger() });
+
+      assert.strictEqual(fs.readFileSync(path.join(dir, 'node_id'), 'utf8'), STORE_ID);
+      for (const name of Object.keys(credentialFiles)) {
+        assert.strictEqual(fs.existsSync(path.join(dir, name)), false, `${name} must not cross the identity transition`);
+      }
+      assert.deepStrictEqual(a2aProtocol.getHubNodeCredentialsReadOnly(STORE_ID), {
+        secret: null,
+        version: null,
+      });
+
+      let observedHeartbeat = null;
+      global.fetch = mockFetch((_n, opts) => {
+        observedHeartbeat = { headers: opts.headers, body: JSON.parse(opts.body) };
+        return responseFromJson({ status: 200, json: { status: 'ok' } });
+      });
+      _resetCachedNodeIdForTesting();
+      const result = await a2aProtocol.sendHeartbeat();
+
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(observedHeartbeat.body.node_id, STORE_ID);
+      assert.strictEqual(observedHeartbeat.headers.Authorization, undefined);
+      assert.strictEqual(observedHeartbeat.headers['X-EvoMap-Node-Secret-Version'], undefined);
+      assert.strictEqual(observedHeartbeat.body.node_secret_version, undefined);
+    } finally {
+      _resetHubNodeSecretStateForTesting();
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+});
+
+test('proxy store-wins clears orphan credentials when canonical owner is missing or invalid', async (t) => {
+  for (const scenario of [
+    { name: 'missing node_id', nodeId: null },
+    { name: 'invalid node_id', nodeId: 'corrupt-node-id' },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const credentialFiles = {
+        node_secret: 'a'.repeat(64),
+        node_secret_version: '99',
+        node_secret_source: 'hub_rotate',
+        node_secret_env_suppressed: 'sha256:' + 'b'.repeat(64),
+      };
+      const dir = makeFakeEvomapDir((evomap) => {
+        if (scenario.nodeId) {
+          fs.writeFileSync(path.join(evomap, 'node_id'), scenario.nodeId, { mode: 0o600 });
+        }
+        for (const [name, value] of Object.entries(credentialFiles)) {
+          fs.writeFileSync(path.join(evomap, name), value, { mode: 0o600 });
+        }
+      });
+      await withFakeEvomapDir(dir, async () => {
+        const savedEnv = {
+          A2A_NODE_SECRET: process.env.A2A_NODE_SECRET,
+          EVOMAP_NODE_SECRET: process.env.EVOMAP_NODE_SECRET,
+          A2A_NODE_SECRET_VERSION: process.env.A2A_NODE_SECRET_VERSION,
+          EVOMAP_NODE_SECRET_VERSION: process.env.EVOMAP_NODE_SECRET_VERSION,
+          A2A_HUB_TOKEN: process.env.A2A_HUB_TOKEN,
+          A2A_HUB_URL: process.env.A2A_HUB_URL,
+        };
+        try {
+          for (const key of Object.keys(savedEnv)) delete process.env[key];
+          process.env.A2A_HUB_URL = 'https://example.test';
+          _resetHubNodeSecretStateForTesting();
+
+          const store = makeStore({ node_id: STORE_ID });
+          new LifecycleManager({ hubUrl: 'https://example.test', store, logger: silentLogger() });
+
+          assert.strictEqual(fs.readFileSync(path.join(dir, 'node_id'), 'utf8'), STORE_ID);
+          for (const name of Object.keys(credentialFiles)) {
+            assert.strictEqual(fs.existsSync(path.join(dir, name)), false, `${name} must be removed`);
+          }
+          assert.deepStrictEqual(a2aProtocol.getHubNodeCredentialsReadOnly(STORE_ID), {
+            secret: null,
+            version: null,
+          });
+
+          let observedHeartbeat = null;
+          global.fetch = mockFetch((_n, opts) => {
+            observedHeartbeat = { headers: opts.headers, body: JSON.parse(opts.body) };
+            return responseFromJson({ status: 200, json: { status: 'ok' } });
+          });
+          _resetCachedNodeIdForTesting();
+          const result = await a2aProtocol.sendHeartbeat();
+
+          assert.strictEqual(result.ok, true);
+          assert.strictEqual(observedHeartbeat.body.node_id, STORE_ID);
+          assert.strictEqual(observedHeartbeat.headers.Authorization, undefined);
+          assert.strictEqual(observedHeartbeat.headers['X-EvoMap-Node-Secret-Version'], undefined);
+          assert.strictEqual(observedHeartbeat.body.node_secret_version, undefined);
+        } finally {
+          _resetHubNodeSecretStateForTesting();
+          for (const [key, value] of Object.entries(savedEnv)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+          }
+        }
+      });
+    });
+  }
+});
+
+test('proxy orphan cleanup failure never restores an ownerless secret as node B', async () => {
+  const orphanSecret = 'a'.repeat(64);
+  const dir = makeFakeEvomapDir((evomap) => {
+    fs.writeFileSync(path.join(evomap, 'node_secret'), orphanSecret, { mode: 0o600 });
+    fs.writeFileSync(path.join(evomap, 'node_secret_version'), '99', { mode: 0o600 });
+    fs.writeFileSync(path.join(evomap, 'node_secret_source'), 'hub_rotate', { mode: 0o600 });
+  });
+  await withFakeEvomapDir(dir, async () => {
+    const savedEnv = {
+      A2A_NODE_SECRET: process.env.A2A_NODE_SECRET,
+      EVOMAP_NODE_SECRET: process.env.EVOMAP_NODE_SECRET,
+      A2A_NODE_SECRET_VERSION: process.env.A2A_NODE_SECRET_VERSION,
+      EVOMAP_NODE_SECRET_VERSION: process.env.EVOMAP_NODE_SECRET_VERSION,
+      A2A_HUB_TOKEN: process.env.A2A_HUB_TOKEN,
+    };
+    for (const key of Object.keys(savedEnv)) delete process.env[key];
+    const secretFile = path.join(dir, 'node_secret');
+    const originalUnlinkSync = fs.unlinkSync;
+    fs.unlinkSync = function (file) {
+      if (file === secretFile) {
+        const err = new Error('simulated orphan credential cleanup failure');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalUnlinkSync.apply(this, arguments);
+    };
+    try {
+      try {
+        const store = makeStore({ node_id: STORE_ID });
+        new LifecycleManager({ hubUrl: 'https://example.test', store, logger: silentLogger() });
+      } finally {
+        fs.unlinkSync = originalUnlinkSync;
+      }
+
+      assert.notStrictEqual(fs.readFileSync(path.join(dir, 'node_id'), 'utf8'), STORE_ID);
+      assert.strictEqual(fs.readFileSync(secretFile, 'utf8'), orphanSecret);
+      assert.deepStrictEqual(a2aProtocol.getHubNodeCredentialsReadOnly(STORE_ID), {
+        secret: null,
+        version: null,
+      });
+    } finally {
+      fs.unlinkSync = originalUnlinkSync;
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+});
+
+test('proxy same-id persistence preserves the complete canonical credential tuple', async () => {
+  const credentialFiles = {
+    node_secret: 'c'.repeat(64),
+    node_secret_version: '11',
+    node_secret_source: 'hub_rotate',
+    node_secret_env_suppressed: 'sha256:' + 'd'.repeat(64),
+  };
+  const dir = makeFakeEvomapDir((evomap) => {
+    fs.writeFileSync(path.join(evomap, 'node_id'), STORE_ID, { mode: 0o600 });
+    for (const [name, value] of Object.entries(credentialFiles)) {
+      fs.writeFileSync(path.join(evomap, name), value, { mode: 0o600 });
+    }
+  });
+  await withFakeEvomapDir(dir, async () => {
+    const store = makeStore({ node_id: STORE_ID });
+    new LifecycleManager({ hubUrl: 'https://example.test', store, logger: silentLogger() });
+
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'node_id'), 'utf8'), STORE_ID);
+    for (const [name, value] of Object.entries(credentialFiles)) {
+      assert.strictEqual(fs.readFileSync(path.join(dir, name), 'utf8'), value);
+    }
+  });
+});
+
+test('proxy transition restores the exact node A snapshot when the post-switch credential clear fails', async () => {
+  const originalCredentials = {
+    node_secret: 'e'.repeat(64),
+    node_secret_version: '13',
+    node_secret_source: 'hub_rotate',
+  };
+  const dir = makeFakeEvomapDir((evomap) => {
+    fs.writeFileSync(path.join(evomap, 'node_id'), LEGACY_ID, { mode: 0o600 });
+    for (const [name, value] of Object.entries(originalCredentials)) {
+      fs.writeFileSync(path.join(evomap, name), value, { mode: 0o600 });
+    }
+  });
+  await withFakeEvomapDir(dir, async () => {
+    const nodeIdFile = path.join(dir, 'node_id');
+    const secretFile = path.join(dir, 'node_secret');
+    const suppressionFile = path.join(dir, 'node_secret_env_suppressed');
+    const racingSecret = 'f'.repeat(64);
+    const originalRenameSync = fs.renameSync;
+    const originalUnlinkSync = fs.unlinkSync;
+    let injectedAfterSwitch = false;
+    let rejectedPostSwitchClear = false;
+
+    fs.renameSync = function (source, target) {
+      const result = originalRenameSync.apply(this, arguments);
+      if (
+        !injectedAfterSwitch &&
+        target === nodeIdFile &&
+        fs.readFileSync(nodeIdFile, 'utf8') === STORE_ID
+      ) {
+        injectedAfterSwitch = true;
+        fs.writeFileSync(secretFile, racingSecret, { mode: 0o600 });
+        fs.writeFileSync(suppressionFile, 'sha256:' + 'a'.repeat(64), { mode: 0o600 });
+      }
+      return result;
+    };
+    fs.unlinkSync = function (file) {
+      if (
+        injectedAfterSwitch &&
+        !rejectedPostSwitchClear &&
+        file === secretFile &&
+        fs.readFileSync(secretFile, 'utf8') === racingSecret
+      ) {
+        rejectedPostSwitchClear = true;
+        const err = new Error('simulated post-switch credential clear failure');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalUnlinkSync.apply(this, arguments);
+    };
+
+    try {
+      const store = makeStore({ node_id: STORE_ID });
+      new LifecycleManager({ hubUrl: 'https://example.test', store, logger: silentLogger() });
+    } finally {
+      fs.renameSync = originalRenameSync;
+      fs.unlinkSync = originalUnlinkSync;
+    }
+
+    assert.strictEqual(injectedAfterSwitch, true, 'test must inject a write after node B is committed');
+    assert.strictEqual(rejectedPostSwitchClear, true, 'test must reject the second credential clear');
+    assert.strictEqual(fs.readFileSync(nodeIdFile, 'utf8'), LEGACY_ID);
+    for (const [name, value] of Object.entries(originalCredentials)) {
+      assert.strictEqual(fs.readFileSync(path.join(dir, name), 'utf8'), value);
+    }
+    assert.strictEqual(fs.existsSync(suppressionFile), false, 'snapshot-absent sibling must stay absent');
+  });
+});
+
+test('canonical tuple lock makes an old node A writer finish before proxy switches to node B', async () => {
+  const rotatedA = 'c'.repeat(64);
+  const dir = makeFakeEvomapDir((evomap) => {
+    fs.writeFileSync(path.join(evomap, 'node_id'), LEGACY_ID, { mode: 0o600 });
+  });
+  await withFakeEvomapDir(dir, async () => {
+    const savedEnv = {
+      A2A_NODE_ID: process.env.A2A_NODE_ID,
+      A2A_NODE_SECRET: process.env.A2A_NODE_SECRET,
+      EVOMAP_NODE_SECRET: process.env.EVOMAP_NODE_SECRET,
+      A2A_NODE_SECRET_VERSION: process.env.A2A_NODE_SECRET_VERSION,
+      EVOMAP_NODE_SECRET_VERSION: process.env.EVOMAP_NODE_SECRET_VERSION,
+      A2A_HUB_TOKEN: process.env.A2A_HUB_TOKEN,
+      A2A_HUB_URL: process.env.A2A_HUB_URL,
+    };
+    const attemptedFile = path.join(dir, 'manager-attempted');
+    const completedFile = path.join(dir, 'manager-completed');
+    const managerPath = require.resolve('../src/proxy/lifecycle/manager');
+    const secretFile = path.join(dir, 'node_secret');
+    const originalRenameSync = fs.renameSync;
+    let child = null;
+    let childCompletedBeforeRename = false;
+    try {
+      for (const key of Object.keys(savedEnv)) delete process.env[key];
+      process.env.A2A_NODE_ID = LEGACY_ID;
+      process.env.A2A_NODE_SECRET = 'a'.repeat(64);
+      process.env.A2A_NODE_SECRET_VERSION = '7';
+      process.env.A2A_HUB_URL = 'https://example.test';
+      _resetHubNodeSecretStateForTesting();
+      _resetCachedNodeIdForTesting();
+      global.fetch = async () => responseFromJson({
+        status: 200,
+        json: {
+          payload: {
+            status: 'acknowledged',
+            node_secret: rotatedA,
+            node_secret_version: 9,
+            your_node_id: LEGACY_ID,
+          },
+        },
+      });
+
+      fs.renameSync = function (source, target) {
+        if (!child && target === secretFile) {
+          const childScript = [
+            "const fs = require('fs');",
+            `const { LifecycleManager } = require(${JSON.stringify(managerPath)});`,
+            `fs.writeFileSync(${JSON.stringify(attemptedFile)}, '1');`,
+            `const state = { node_id: ${JSON.stringify(STORE_ID)} };`,
+            'const store = {',
+            '  getState: (key) => state[key] === undefined ? null : state[key],',
+            '  setState: (key, value) => { state[key] = value; },',
+            '  countPending: () => 0, writeInbound: () => {}, writeInboundBatch: () => {},',
+            '};',
+            'const logger = { log: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} };',
+            "new LifecycleManager({ hubUrl: 'https://example.test', store, logger });",
+            `fs.writeFileSync(${JSON.stringify(completedFile)}, '1');`,
+          ].join('\n');
+          const childEnv = { ...process.env, EVOLVER_HOME: dir };
+          delete childEnv.A2A_NODE_ID;
+          delete childEnv.A2A_NODE_SECRET;
+          delete childEnv.EVOMAP_NODE_SECRET;
+          delete childEnv.A2A_NODE_SECRET_VERSION;
+          delete childEnv.EVOMAP_NODE_SECRET_VERSION;
+          delete childEnv.A2A_HUB_TOKEN;
+          child = spawn(process.execPath, ['-e', childScript], {
+            env: childEnv,
+            stdio: 'ignore',
+          });
+          const attemptDeadline = Date.now() + 5_000;
+          while (!fs.existsSync(attemptedFile) && Date.now() < attemptDeadline) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+          assert.strictEqual(fs.existsSync(attemptedFile), true, 'child must reach manager construction');
+          const blockedDeadline = Date.now() + 500;
+          while (!fs.existsSync(completedFile) && Date.now() < blockedDeadline) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+          childCompletedBeforeRename = fs.existsSync(completedFile);
+        }
+        return originalRenameSync.apply(this, arguments);
+      };
+
+      const hello = await a2aProtocol.sendHelloToHub();
+      assert.strictEqual(hello.ok, true);
+    } finally {
+      fs.renameSync = originalRenameSync;
+    }
+
+    assert.ok(child, 'test must start the proxy transition process');
+    const childExit = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+    assert.deepStrictEqual(childExit, { code: 0, signal: null });
+    assert.strictEqual(childCompletedBeforeRename, false, 'manager must wait while node A owns the tuple lock');
+
+    try {
+      for (const key of Object.keys(savedEnv)) delete process.env[key];
+      process.env.A2A_HUB_URL = 'https://example.test';
+      _resetHubNodeSecretStateForTesting();
+      _resetCachedNodeIdForTesting();
+      assert.strictEqual(fs.readFileSync(path.join(dir, 'node_id'), 'utf8'), STORE_ID);
+      for (const name of [
+        'node_secret',
+        'node_secret_version',
+        'node_secret_source',
+        'node_secret_env_suppressed',
+      ]) {
+        assert.strictEqual(fs.existsSync(path.join(dir, name)), false, `${name} must be absent after node B wins`);
+      }
+      assert.deepStrictEqual(a2aProtocol.getHubNodeCredentialsReadOnly(STORE_ID), {
+        secret: null,
+        version: null,
+      });
+
+      let observedHeartbeat = null;
+      global.fetch = mockFetch((_n, opts) => {
+        observedHeartbeat = { headers: opts.headers, body: JSON.parse(opts.body) };
+        return responseFromJson({ status: 200, json: { status: 'ok' } });
+      });
+      const heartbeat = await a2aProtocol.sendHeartbeat();
+      assert.strictEqual(heartbeat.ok, true, JSON.stringify(heartbeat));
+      assert.strictEqual(observedHeartbeat.body.node_id, STORE_ID);
+      assert.strictEqual(observedHeartbeat.headers.Authorization, undefined);
+      assert.strictEqual(observedHeartbeat.headers['X-EvoMap-Node-Secret-Version'], undefined);
+      assert.strictEqual(observedHeartbeat.body.node_secret_version, undefined);
+    } finally {
+      _resetHubNodeSecretStateForTesting();
+      _resetCachedNodeIdForTesting();
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 });
 

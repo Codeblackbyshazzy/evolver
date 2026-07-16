@@ -1111,11 +1111,14 @@ async function main() {
           if (_keepAliveTimer) { clearInterval(_keepAliveTimer); _keepAliveTimer = null; }
           stopLockRefresh();
           releaseLock();
+          // Stop event delivery independently because proxy mode owns its own
+          // lifecycle heartbeat and never starts the a2a heartbeat. This clears
+          // both managed SSE and the self-driving poll on every daemon path.
+          try { require('./src/gep/a2aProtocol').stopEventDelivery(); } catch (e) {}
           // stopHeartbeat() clears the drift detector interval and the heartbeat
           // timer, preventing "ghost tick" log noise after exit and ensuring a
           // clean state if the process is somehow continued (test harness, etc.).
           try { require('./src/gep/a2aProtocol').stopHeartbeat(); } catch (e) {}
-          try { require('./src/gep/a2aProtocol').stopEventStream(); } catch (e) {}
         }
         process.on('exit', shutdown);
         process.on('SIGINT', () => { shutdown(); process.exit(); });
@@ -1450,6 +1453,29 @@ async function main() {
               clientSettings: {},
             });
             console.log('[Proxy] Started on ' + proxyInfo.url);
+            const a2a = require('./src/gep/a2aProtocol');
+            try {
+              const lifecycle = proxyInfo && proxyInfo.proxy && proxyInfo.proxy.lifecycle;
+              a2a.startEventDelivery({
+                hubUrl: proxyInfo && proxyInfo.proxy && proxyInfo.proxy.hubUrl,
+                nodeId: proxyInfo && proxyInfo.nodeId,
+                // Proxy delivery uses SSE by default for real-time events. Operators
+                // can explicitly disable the additional authenticated connection.
+                enableSse: parseBoolEnv(process.env.EVOLVER_PROXY_SSE_ENABLED, true),
+                identityProvider: lifecycle ? {
+                  getNodeId: function () { return lifecycle.nodeId; },
+                  getHeaders: function () { return lifecycle._buildHeaders(); },
+                  subscribe: function (listener) { return lifecycle.onDeliveryIdentityChange(listener); },
+                } : null,
+                onEventsAccepted: proxyInfo && proxyInfo.proxy
+                  ? function (events) { proxyInfo.proxy.acceptHubEvents(events); }
+                  : null,
+              });
+            }
+            catch (deliveryErr) {
+              console.warn('[Events] startEventDelivery failed: ' +
+                (deliveryErr && deliveryErr.message || deliveryErr));
+            }
             try {
               const { injectProxyEnv } = require('./src/proxy/inject');
               const injected = injectProxyEnv(proxyInfo);
@@ -1465,7 +1491,6 @@ async function main() {
             registerMailboxTransport();
             process.env.A2A_TRANSPORT = 'mailbox';
             try {
-              const a2a = require('./src/gep/a2aProtocol');
               a2a.startSystemdNotifyWatchdog(function () {
                 try {
                   const proxy = proxyInfo && proxyInfo.proxy;
@@ -2552,10 +2577,27 @@ async function main() {
     }
 
   } else if (command === 'sync') {
-    const { getHubUrl, getNodeId, buildHubHeaders, sendHelloToHub, getHubNodeSecret } = require('./src/gep/a2aProtocol');
+    const {
+      getHubUrl,
+      getNodeId,
+      buildHubHeaders,
+      buildHubHeadersReadOnly,
+      sendHelloToHub,
+      getHubNodeSecret,
+      getHubIdentityTupleReadOnly,
+    } = require('./src/gep/a2aProtocol');
     const { hubFetch } = require('./src/gep/hubFetch');
-    const { upsertGene, upsertCapsule, loadGenes, loadCapsules } = require('./src/gep/assetStore');
+    const {
+      upsertSyncedGene,
+      upsertCapsule,
+      loadGenes,
+      loadGenesReadOnly,
+      loadCapsules,
+      loadCapsulesReadOnly,
+    } = require('./src/gep/assetStore');
+    const { prepareSyncAsset } = require('./src/gep/syncAsset');
     const { getGepAssetsDir, getMemoryDir } = require('./src/gep/paths');
+    const dryRun = args.includes('--dry-run');
 
     const hubUrl = getHubUrl();
     if (!hubUrl) {
@@ -2564,7 +2606,10 @@ async function main() {
     }
 
     try {
-      if (!getHubNodeSecret()) {
+      const readOnlyIdentity = dryRun ? getHubIdentityTupleReadOnly() : null;
+      const nodeSecret = dryRun ? readOnlyIdentity.secret : getHubNodeSecret();
+      const nodeSecretVersion = dryRun ? readOnlyIdentity.version : null;
+      if (!nodeSecret && !dryRun) {
         // Round-7 (§20.7): refuse a fresh hello if a live daemon owns
         // the lock; the daemon's secret will appear shortly.
         refuseHelloIfDaemonRunning('sync');
@@ -2577,7 +2622,21 @@ async function main() {
         console.log('[sync] Registered as ' + getNodeId());
       }
 
-      const nodeId = getNodeId();
+      const hubHeaders = dryRun
+        ? function () {
+          const headers = buildHubHeadersReadOnly(nodeSecret, nodeSecretVersion);
+          if (!headers.Authorization) {
+            throw new Error('Dry-run requires an existing node_secret or a valid OAuth access token; refusing an unauthenticated Hub request.');
+          }
+          return headers;
+        }
+        : buildHubHeaders;
+      if (dryRun) hubHeaders();
+      const nodeId = dryRun ? readOnlyIdentity.nodeId : getNodeId();
+      if (dryRun && !nodeId) {
+        console.error('[sync] Dry-run requires an existing node_id; refusing to generate identity state.');
+        process.exit(1);
+      }
       const baseUrl = hubUrl.replace(/\/+$/, '');
       const typeFilter = (function () {
         const f = args.find(function (a) { return typeof a === 'string' && a.startsWith('--type='); });
@@ -2595,7 +2654,6 @@ async function main() {
         const f = args.find(function (a) { return typeof a === 'string' && a.startsWith('--export='); });
         return f ? f.slice('--export='.length) : null;
       })();
-      const dryRun = args.includes('--dry-run');
       const listUnpublished = !args.includes('--no-unpublished-list');
       const force = args.includes('--force');
       const limitPerPage = 100;
@@ -2624,7 +2682,7 @@ async function main() {
           }
           const resp = await hubFetch(url, {
             method: 'GET',
-            headers: buildHubHeaders(),
+            headers: hubHeaders(),
             signal: AbortSignal.timeout(30000),
           });
           if (!resp.ok) {
@@ -2672,8 +2730,8 @@ async function main() {
         }
       }
 
-      const existingGenes = dryRun ? loadGenes({ seed: false }) : loadGenes();
-      const existingCapsules = loadCapsules();
+      const existingGenes = dryRun ? loadGenesReadOnly() : loadGenes();
+      const existingCapsules = dryRun ? loadCapsulesReadOnly() : loadCapsules();
       // Dedup by Hub asset_id is the only safe key. Local-facing `id` (e.g.
       // `gene_gep_repair_from_errors`) collides between bundled default seed
       // genes and identically-named assets that the user later published, so
@@ -2689,6 +2747,8 @@ async function main() {
       }
       const localGeneIds = new Set(existingGenes.filter(function (g) { return g && g.id; }).map(function (g) { return g.id; }));
       const localCapsuleIds = new Set(existingCapsules.filter(function (c) { return c && c.id; }).map(function (c) { return c.id; }));
+      const batchGeneIds = new Map();
+      const batchCapsuleIds = new Map();
 
       let synced = 0;
       let skippedAlreadySynced = 0;
@@ -2713,81 +2773,99 @@ async function main() {
           continue;
         }
 
-        // Local-id collision: a local entry with the same user-facing id
-        // already exists but has no hub_asset_id (e.g. bundled default seed
-        // gene, or a hand-edited entry). Without --force we keep the
-        // user-owned entry and warn so the user can decide.
-        if (!force) {
-          if (assetType === 'Gene' && localGeneIds.has(localId)) {
-            if (isVerbose) console.warn('  [sync] Skipping ' + localId + ' (local id collision; pass --force to overwrite with Hub copy)');
-            skippedIdCollision++;
-            continue;
+        const localIds = assetType === 'Gene' ? localGeneIds : localCapsuleIds;
+        // The list response is the only identity hint available until detail
+        // fetch and payload validation succeed. If it already names a local
+        // entry, fail closed on those preliminary failures: preserve the local
+        // copy and let --force make the overwrite intent explicit.
+        const hasListIdCollision = !force && localIds.has(localId);
+        function skipUnverifiedListIdCollision(stage) {
+          if (isVerbose) {
+            console.warn(
+              '  [sync] Skipping ' + JSON.stringify(String(localId)) +
+              ' (local id collision; ' + stage +
+              '; pass --force to overwrite with Hub copy)'
+            );
           }
-          if (assetType === 'Capsule' && localCapsuleIds.has(localId)) {
-            if (isVerbose) console.warn('  [sync] Skipping ' + localId + ' (local id collision; pass --force to overwrite with Hub copy)');
-            skippedIdCollision++;
+          skippedIdCollision++;
+        }
+
+        let payload = asset.payload;
+        if (!payload) {
+          try {
+            const detailResp = await hubFetch(baseUrl + '/a2a/assets/' + encodeURIComponent(assetId) + '?detailed=true', {
+              method: 'GET',
+              headers: hubHeaders(),
+              signal: AbortSignal.timeout(15000),
+            });
+            if (!detailResp.ok) {
+              throw new Error('detail HTTP ' + detailResp.status);
+            }
+            const detail = await detailResp.json();
+            payload = detail && detail.payload;
+          } catch (detailErr) {
+            if (hasListIdCollision) {
+              skipUnverifiedListIdCollision('could not fetch Hub detail');
+            } else {
+              if (isVerbose) console.warn('  [sync] Error fetching ' + assetId + ': ' + (detailErr && detailErr.message || detailErr));
+              fetchErrors++;
+            }
             continue;
           }
         }
 
-        if (dryRun) {
-          console.log('  [dry-run] Would sync: ' + assetType + ' ' + assetId + (force ? ' (force)' : ''));
-          synced++;
+        let syncAsset;
+        try {
+          const syncedAt = new Date().toISOString();
+          syncAsset = prepareSyncAsset({
+            assetType,
+            payload,
+            assetId,
+            localId,
+            summary: asset.summary || '',
+            syncedAt,
+          });
+        } catch (prepareErr) {
+          if (hasListIdCollision) {
+            skipUnverifiedListIdCollision('could not validate Hub payload');
+          } else {
+            if (isVerbose) console.warn('  [sync] Error fetching ' + assetId + ': ' + (prepareErr && prepareErr.message || prepareErr));
+            fetchErrors++;
+          }
           continue;
         }
 
         try {
-          let payload = asset.payload;
-          if (!payload) {
-            const detailResp = await hubFetch(baseUrl + '/a2a/assets/' + encodeURIComponent(assetId) + '?detailed=true', {
-              method: 'GET',
-              headers: buildHubHeaders(),
-              signal: AbortSignal.timeout(15000),
-            });
-            if (!detailResp.ok) {
-              if (isVerbose) console.warn('  [sync] Failed to fetch detail for ' + assetId + ' (HTTP ' + detailResp.status + ')');
-              fetchErrors++;
-              continue;
-            }
-            const detail = await detailResp.json();
-            payload = detail.payload || {};
+          const effectiveLocalId = syncAsset.id;
+          const batchIds = assetType === 'Gene' ? batchGeneIds : batchCapsuleIds;
+          const batchAssetId = batchIds.get(effectiveLocalId);
+
+          if (batchAssetId && batchAssetId !== String(assetId)) {
+            throw new Error('duplicate local id ' + effectiveLocalId + ' in Hub batch (' + batchAssetId + ', ' + assetId + ')');
+          }
+          batchIds.set(effectiveLocalId, String(assetId));
+
+          // Local-id collision: a local entry with the same user-facing id
+          // already exists but has no matching hub_asset_id. Without --force
+          // we keep the local entry and report the collision.
+          if (!force && localIds.has(effectiveLocalId)) {
+            if (isVerbose) console.warn('  [sync] Skipping ' + effectiveLocalId + ' (local id collision; pass --force to overwrite with Hub copy)');
+            skippedIdCollision++;
+            continue;
           }
 
-          if (assetType === 'Gene') {
-            const geneObj = {
-              type: 'Gene',
-              id: payload.id || localId,
-              category: payload.category || 'unknown',
-              signals: Array.isArray(payload.signals) ? payload.signals : [],
-              strategy: Array.isArray(payload.strategy) ? payload.strategy : [],
-              avoid: Array.isArray(payload.avoid) ? payload.avoid : [],
-              validation: payload.validation || {},
-              summary: payload.summary || asset.summary || '',
-              hub_asset_id: assetId,
-              synced_at: new Date().toISOString(),
-            };
-            upsertGene(geneObj);
-            localGeneIds.add(geneObj.id);
-            localHubAssetIds.add(String(assetId));
+          if (dryRun) {
+            console.log('  [dry-run] Would sync: ' + assetType + ' ' + assetId + (force ? ' (force)' : ''));
+          } else if (assetType === 'Gene') {
+            upsertSyncedGene(syncAsset);
           } else {
-            const capsuleObj = {
-              type: 'Capsule',
-              id: payload.id || localId,
-              gene: payload.gene || null,
-              genes_used: Array.isArray(payload.genes_used) ? payload.genes_used : [],
-              outcome: payload.outcome || {},
-              execution_trace: payload.execution_trace || {},
-              summary: payload.summary || asset.summary || '',
-              hub_asset_id: assetId,
-              synced_at: new Date().toISOString(),
-            };
-            upsertCapsule(capsuleObj);
-            localCapsuleIds.add(capsuleObj.id);
-            localHubAssetIds.add(String(assetId));
+            upsertCapsule(syncAsset);
           }
+          localIds.add(effectiveLocalId);
+          localHubAssetIds.add(String(assetId));
           synced++;
-        } catch (fetchErr) {
-          if (isVerbose) console.warn('  [sync] Error fetching ' + assetId + ': ' + (fetchErr && fetchErr.message || fetchErr));
+        } catch (syncErr) {
+          if (isVerbose) console.warn('  [sync] Error syncing ' + assetId + ': ' + (syncErr && syncErr.message || syncErr));
           fetchErrors++;
         }
       }
@@ -2798,7 +2876,7 @@ async function main() {
         console.log('[sync] ' + skippedIdCollision + ' Hub asset(s) share a local id with an existing local entry that has no hub_asset_id.');
         console.log('[sync] Re-run with --force to overwrite those local entries with the Hub copies.');
       }
-      if (dryRun) console.log('[sync] (dry-run mode: no files were modified)');
+      if (dryRun) console.log('[sync] (dry-run mode: no asset-store or export files were modified)');
 
       if (listUnpublished && doPublished) {
         const hubGeneIds = new Set();
@@ -2849,6 +2927,7 @@ async function main() {
           }
         }
       }
+      if (fetchErrors > 0) process.exitCode = 1;
     } catch (error) {
       if (error && error.name === 'TimeoutError') {
         console.error('[sync] Request timed out. Check your network and A2A_HUB_URL.');
